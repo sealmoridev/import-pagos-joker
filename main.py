@@ -17,12 +17,14 @@ def connect_to_odoo():
 
     return models, db, uid, password
 
-def format_date(date_str):
+def format_date(date_val):
     """Convierte la fecha al formato requerido dd-mm-aaaa"""
-    if isinstance(date_str, str):
-        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+    if isinstance(date_val, pd.Timestamp):
+        date_obj = date_val.to_pydatetime()
+    elif isinstance(date_val, str):
+        date_obj = datetime.strptime(date_val, '%Y-%m-%d')
     else:
-        date_obj = date_str
+        date_obj = date_val
     return date_obj.strftime('%d-%m-%Y')
 
 def create_invoice_and_payment(models, db, uid, password, row):
