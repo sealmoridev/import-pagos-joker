@@ -670,7 +670,7 @@ def main():
 
                 # Validar el estado de las órdenes
                 status_container.info("Validando estado de las órdenes...")
-                orders_status_df = validate_orders_status(models, db, uid, password, df)
+                validate_orders_status(models, db, uid, password, df)rders_status_df = validate_orders_status(models, db, uid, password, df)
 
                 # Mostrar los resultados de la validación
                 st.write("Estado de las órdenes:")
