@@ -12,7 +12,9 @@ channel = "stable-24_05"
 run = ["streamlit", "run", "--server.address", "0.0.0.0", "--server.enableWebsocketCompression=false", "--server.runOnSave=false", "main.py"]
 ignorePorts = false
 deploymentTarget = "gce"
+deploymentSecrets = ["odoo"]
 
 [[ports]]
 localPort = 8501
 externalPort = 80
+exposeLocalhost = true

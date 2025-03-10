@@ -10,9 +10,17 @@ def show_login_form():
     """Muestra el formulario de login y retorna las credenciales"""
     st.sidebar.title("Inicio de Sesión")
 
-    # Obtener URL y DB de secrets.toml
-    url = st.secrets["odoo"]["odoo_url"]
-    db = st.secrets["odoo"]["odoo_db"]
+    # Obtener URL y DB de secrets.toml con manejo de errores
+    try:
+        url = st.secrets.get("odoo", {}).get("odoo_url", "")
+        db = st.secrets.get("odoo", {}).get("odoo_db", "")
+        
+        if not url or not db:
+            st.sidebar.error("⚠️ Configuración de Odoo incompleta. Verifique el archivo secrets.toml.")
+            return None, None, None, None
+    except Exception as e:
+        st.sidebar.error(f"⚠️ Error al cargar configuración: {str(e)}")
+        return None, None, None, None
 
     
     # Formulario de login en el sidebar
