@@ -11,8 +11,8 @@ def show_login_form():
     st.sidebar.title("Inicio de Sesión")
 
     # Obtener URL y DB de secrets.toml
-    url = st.secrets["odoo_url"]
-    db = st.secrets["odoo_db"]
+    url = st.secrets["odoo"]["odoo_url"]
+    db = st.secrets["odoo"]["odoo_db"]
 
     
     # Formulario de login en el sidebar
@@ -224,7 +224,8 @@ def connect_to_odoo():
 
         # Mostrar intentando conectar con servidor
         status_container.info(f"Estableciendo conexión con {url}...")
-        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True)
+        # Add timeout to prevent connection hanging
+        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, use_datetime=True, timeout=60)
 
         # Mostrar intentando autenticar
         status_container.info("Autenticando...")
