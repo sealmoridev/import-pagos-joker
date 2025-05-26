@@ -885,15 +885,4 @@ def main():
             import traceback
             st.error(traceback.format_exc())
 
-if __name__ == "__main__":
-    # Inicializar variables de estado si no existen
-    if 'validation_complete' not in st.session_state:
-        st.session_state['validation_complete'] = False
-
-    if 'show_process_button' not in st.session_state:
-        st.session_state['show_process_button'] = False
-
-    if 'orders_status_df' not in st.session_state:
-        st.session_state['orders_status_df'] = None
-
-    main()
+main()
