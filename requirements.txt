@@ -2,4 +2,5 @@ streamlit==1.27.2
 pandas==2.2.3
 pytz==2025.1
 openpyxl==3.1.5
-python-dotenv
+python-dotenv==1.0.0
+xmlrpc
