@@ -5,21 +5,21 @@ from datetime import datetime
 import pytz
 import time
 import re
+import os
+from dotenv import load_dotenv
+
+# Cargar variables de entorno desde .env si existe
+load_dotenv()
 
 def show_login_form():
     """Muestra el formulario de login y retorna las credenciales"""
     st.sidebar.title("Inicio de Sesión")
 
-    # Obtener URL y DB de secrets.toml con manejo de errores
-    try:
-        url = st.secrets.get("odoo", {}).get("odoo_url", "")
-        db = st.secrets.get("odoo", {}).get("odoo_db", "")
-        
-        if not url or not db:
-            st.sidebar.error("⚠️ Configuración de Odoo incompleta. Verifique el archivo secrets.toml.")
-            return None, None, None, None
-    except Exception as e:
-        st.sidebar.error(f"⚠️ Error al cargar configuración: {str(e)}")
+    # Obtener URL y DB desde variables de entorno
+    url = os.environ.get("ODOO_URL", "")
+    db = os.environ.get("ODOO_DB", "")
+    if not url or not db:
+        st.sidebar.error("⚠️ Configuración de Odoo incompleta. Defina ODOO_URL y ODOO_DB en el entorno o en el archivo .env.")
         return None, None, None, None
 
     
@@ -74,7 +74,7 @@ def validate_excel_format(df):
 
     # Obtener los valores válidos para Forma de Pago del mapping
     valid_payment_methods = {
-        'TRANSF', 'DEP', 'BEX', 'CV', 'IN', 'SBE', 'EFECT OF', 'MAQ/TD', 'MAQ/TC'
+        'TRANSF', 'DEP', 'BEX', 'CV', 'IN', 'SBE', 'EFECT OF', 'MAQ/TD', 'MAQ/TC', 'WEBPAY'
     }
 
     # Recorrer cada fila y validar
@@ -301,7 +301,8 @@ def get_journal_id(payment_method):
         'SBE': 7,     # ID del diario de Sucursal Banco Estado
         'EFECT OF': 6,# ID del diario de Efectivo
         'MAQ/TD': 7,  # ID del diario de Transbank Débito
-        'MAQ/TC': 7   # ID del diario de Transbank Crédito
+        'MAQ/TC': 7,   # ID del diario de Transbank Crédito
+        'WEBPAY': 7   # ID del diario de Webpay
     }
     return journal_mapping.get(payment_method, 7)
 
@@ -670,7 +671,7 @@ def main():
 
                 # Validar el estado de las órdenes
                 status_container.info("Validando estado de las órdenes...")
-                validate_orders_status(models, db, uid, password, df)rders_status_df = validate_orders_status(models, db, uid, password, df)
+                orders_status_df = validate_orders_status(models, db, uid, password, df)
 
                 # Mostrar los resultados de la validación
                 st.write("Estado de las órdenes:")
