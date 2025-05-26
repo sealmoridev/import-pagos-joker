@@ -1,1 +1,1 @@
-web: streamlit run main.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --browser.serverAddress=0.0.0.0 --server.enableCORS=false
+web: python -c "import os; port = int(os.environ.get('PORT', 8080)); print(f'Starting on port {port}'); os.system(f'streamlit run main.py --server.port={port} --server.address=0.0.0.0 --server.headless=true --server.enableCORS=false')"
