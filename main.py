@@ -44,6 +44,8 @@ def show_login_form():
             return None, None, None, None
 
         # Guardar credenciales en sesión
+        st.session_state['odoo_url'] = url
+        st.session_state['odoo_db'] = db
         st.session_state['odoo_username'] = username
         st.session_state['odoo_password'] = password
         st.session_state['is_logged_in'] = True
@@ -52,9 +54,18 @@ def show_login_form():
 
     # Si hay credenciales guardadas, devolverlas
     if st.session_state.get('is_logged_in', False):
+        # Asegurarse de que url y db estén en la sesión, si no, usar los valores del entorno
+        session_url = st.session_state.get('odoo_url', url)
+        session_db = st.session_state.get('odoo_db', db)
+        
+        # Si no hay url o db en la sesión ni en el entorno, mostrar error
+        if not session_url or not session_db:
+            st.sidebar.error("⚠️ Configuración de Odoo incompleta. Defina ODOO_URL y ODOO_DB.")
+            return None, None, None, None
+            
         return (
-            url,
-            db,
+            session_url,
+            session_db,
             st.session_state.get('odoo_username', ''),
             st.session_state.get('odoo_password', '')
         )
@@ -232,8 +243,8 @@ def connect_to_odoo():
 
         # Mostrar intentando conectar con servidor
         status_container.info(f"Estableciendo conexión con {url}...")
-        # Add timeout to prevent connection hanging
-        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, use_datetime=True, timeout=60)
+        # Crear conexión sin timeout (compatible con todas las versiones de Python)
+        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, use_datetime=True)
 
         # Mostrar intentando autenticar
         status_container.info("Autenticando...")
@@ -247,7 +258,7 @@ def connect_to_odoo():
             return None, None, None, None
 
         # Conexión exitosa, mostrar indicador de éxito
-        models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True)
+        models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True, use_datetime=True)
         status_container.success(f"✅ Conexión exitosa a Odoo ({url})")
         return models, db, uid, password
     except Exception as e:
@@ -327,6 +338,13 @@ def register_payment_from_invoice(models, db, uid, password, invoice_id, payment
     """Registra el pago usando el wizard nativo de Odoo"""
     try:
         update_step("Preparando registro de pago...")
+        # Verificar que la factura existe
+        try:
+            invoice_check = models.execute_kw(db, uid, password, 'account.move', 'read', [[invoice_id]], {'fields': ['name', 'state']})
+            update_step(f"Factura encontrada: {invoice_check[0]['name']} (Estado: {invoice_check[0]['state']})")
+        except Exception as e:
+            update_step(f"\u26a0\ufe0f No se pudo verificar la factura: {str(e)}")
+            
         context = {
             'active_model': 'account.move',
             'active_ids': [invoice_id],
@@ -343,27 +361,52 @@ def register_payment_from_invoice(models, db, uid, password, invoice_id, payment
             'payment_type': 'inbound'
         }
 
-        update_step("Creando wizard de pago...")
-        payment_register = models.execute_kw(db, uid, password,
-            'account.payment.register', 'create',
-            [wizard_vals],
-            {'context': context})
+        update_step(f"Creando wizard de pago con valores: {wizard_vals}")
+        
+        # Agregar manejo de tiempo para detectar operaciones lentas
+        import time
+        start_time = time.time()
+        
+        try:
+            payment_register = models.execute_kw(db, uid, password,
+                'account.payment.register', 'create',
+                [wizard_vals],
+                {'context': context})
+            elapsed = time.time() - start_time
+            update_step(f"Wizard creado en {elapsed:.2f} segundos, ID: {payment_register}")
+        except Exception as e:
+            update_step(f"\u274c Error al crear el wizard de pago: {str(e)}")
+            return False
 
         if not payment_register:
-            update_step("❌ Error al crear el wizard de pago")
+            update_step("\u274c Error al crear el wizard de pago: No se obtuvo ID")
             return False
 
         update_step("Ejecutando pago...")
-        result = models.execute_kw(db, uid, password,
-            'account.payment.register', 'action_create_payments',
-            [[payment_register]],
-            {'context': context})
+        start_time = time.time()
+        
+        try:
+            result = models.execute_kw(db, uid, password,
+                'account.payment.register', 'action_create_payments',
+                [[payment_register]],
+                {'context': context})
+            elapsed = time.time() - start_time
+            update_step(f"Pago ejecutado en {elapsed:.2f} segundos, Resultado: {result}")
+        except Exception as e:
+            update_step(f"\u274c Error al ejecutar el pago: {str(e)}")
+            return False
 
-        update_step("✅ Pago registrado exitosamente")
+        if not result:
+            update_step("\u26a0\ufe0f Advertencia: El pago se ejecutó pero no retornó resultado")
+            
+        update_step("\u2705 Pago registrado exitosamente")
         return True
 
     except Exception as e:
-        update_step(f"❌ Error al registrar pago: {str(e)}")
+        import traceback
+        error_trace = traceback.format_exc()
+        update_step(f"\u274c Error al registrar pago: {str(e)}")
+        update_step(f"Detalles del error: {error_trace}")
         return False
 
 def process_record(models, db, uid, password, row, orders_status_df, progress_bar, progress_step, update_step):
@@ -601,13 +644,10 @@ def main():
 
     # Botón para cerrar sesión
     if st.sidebar.button("Cerrar Sesión"):
-        # Solo eliminamos las credenciales de usuario y el estado de login
-        if 'odoo_username' in st.session_state:
-            del st.session_state['odoo_username']
-        if 'odoo_password' in st.session_state:
-            del st.session_state['odoo_password']
-        if 'is_logged_in' in st.session_state:
-            del st.session_state['is_logged_in']
+        # Eliminar todas las credenciales y el estado de login
+        for key in ['odoo_url', 'odoo_db', 'odoo_username', 'odoo_password', 'is_logged_in']:
+            if key in st.session_state:
+                del st.session_state[key]
         st.experimental_rerun()
     
     st.write("Esta herramienta permite importar pagos a Odoo desde un archivo Excel.")
