@@ -645,21 +645,103 @@ def main():
     # Botón para cerrar sesión
     if st.sidebar.button("Cerrar Sesión"):
         # Eliminar todas las credenciales y el estado de login
-        for key in ['odoo_url', 'odoo_db', 'odoo_username', 'odoo_password', 'is_logged_in']:
+        for key in ['odoo_url', 'odoo_db', 'odoo_username', 'odoo_password', 'is_logged_in', 'processing_complete']:
             if key in st.session_state:
                 del st.session_state[key]
         st.experimental_rerun()
     
     st.write("Esta herramienta permite importar pagos a Odoo desde un archivo Excel.")
+    
+    # Inicializar la variable de estado si no existe
+    if 'processing_complete' not in st.session_state:
+        st.session_state['processing_complete'] = False
 
     # Crear contenedor para estado general
     status_container = st.empty()
     progress_container = st.empty()
     details_container = st.empty()
+    
+    # Mostrar el formulario de carga solo si no hay un procesamiento completo
+    if not st.session_state['processing_complete']:
+        uploaded_file = st.file_uploader("Cargar archivo Excel", type=['xlsx'])
+    else:
+        uploaded_file = None
 
-    uploaded_file = st.file_uploader("Cargar archivo Excel", type=['xlsx'])
-
-    if uploaded_file is not None:
+    # Procesar el archivo subido o mostrar los resultados anteriores
+    if st.session_state['processing_complete']:
+        # Mostrar los resultados guardados en la sesión
+        if 'processing_results' in st.session_state and 'results_df' in st.session_state:
+            results = st.session_state['processing_results']
+            results_df = st.session_state['results_df']
+            
+            # Mostrar el mensaje de éxito
+            st.success(f"✅ Procesamiento completado: {results['total_processed']} registros")
+            
+            # Botón de descarga del log
+            st.download_button(
+                label="Descargar Log Completo",
+                data=st.session_state['log_file'].encode('utf-8'),
+                file_name="log_procesamiento.txt",
+                mime="text/plain",
+                key="persistent_download_log"
+            )
+            
+            # Mostrar resultados
+            st.write("### Resultados del Procesamiento:")
+            
+            # Función para colorear las filas según el resultado
+            def highlight_status(row):
+                if row['Status'] == 'Éxito':
+                    return ['background-color: #CCFFCC'] * len(row)
+                elif row['Status'] == 'Parcial':
+                    return ['background-color: #FFFFCC'] * len(row)
+                elif row['Status'] == 'Omitido':
+                    return ['background-color: #EFEFEF'] * len(row)
+                else:
+                    return ['background-color: #FFCCCC'] * len(row)
+            
+            # Mostrar el dataframe con los resultados
+            if isinstance(results_df, pd.DataFrame) and not results_df.empty:
+                st.dataframe(results_df.style.apply(highlight_status, axis=1))
+            
+                # Mostrar resumen
+                st.write("Resumen:")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total procesados", results['total_processed'])
+                with col2:
+                    st.metric("Facturas creadas", results['facturas_creadas'])
+                with col3:
+                    st.metric("Pagos registrados", results['pagos_registrados'])
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Conciliaciones exitosas", results['conciliaciones_exitosas'])
+                with col2:
+                    st.metric("Órdenes omitidas", results['ordenes_omitidas'])
+                with col3:
+                    st.metric("Tasa de éxito", f"{results['success_rate']}%")
+            
+            # Descargar resultados
+            st.download_button(
+                label="Descargar Resultados",
+                data=results_df.to_csv(index=False).encode('utf-8'),
+                file_name="resultados_importacion.csv",
+                mime="text/csv",
+                key="persistent_download_results"
+            )
+            
+            # Botón para iniciar una nueva carga de datos
+            st.write("")
+            st.write("")
+            if st.button("Iniciar una nueva carga de datos", key="persistent_new_upload"):
+                # Reiniciar el estado pero mantener las credenciales de sesión
+                for key in ['orders_status_df', 'validation_complete', 'show_process_button', 
+                          'processing_complete', 'processing_results', 'log_file', 'results_df']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.experimental_rerun()
+    elif uploaded_file is not None:
         try:
             # Cargar el Excel pero sin procesar las fechas aún
             df = pd.read_excel(uploaded_file)
@@ -802,28 +884,145 @@ def main():
                         record_progress = st.progress(0)
                         current_step_info = st.empty()
 
-                    # Variables para estadísticas
+                    
+                    # Preparar variables para el procesamiento
+                    results = []
+                    log_entries = []
                     processed = 0
                     successful = 0
                     errors = 0
-
-                    # Preparar log de actividad
-                    log_entries = []
-
+                    
                     # Número de pasos en el proceso
                     total_steps = 10
                     progress_step = 1.0 / total_steps
+                    
+                    # Validar el formato del archivo
+                    validation_errors = validate_excel_format(df)
+                    if validation_errors and isinstance(validation_errors, list) and validation_errors:
+                        st.error("\n".join([str(error) for error in validation_errors]))
+                        return
+                    
+                    # Conectar a Odoo
+                    models, db, uid, password = connect_to_odoo()
+                    if not models:
+                        st.error("No se pudo conectar a Odoo. Verifique sus credenciales.")
+                        return
+                        
+                    # Preparar DataFrame para el estado de las órdenes
+                    # Esto reemplaza la función check_orders_status que no está implementada
+                    orders_data = []
+                    for _, row in df.iterrows():
+                        reserva = "Desconocido"
+                        try:
+                            reserva = str(row['Reserva']).strip()
+                            # Buscar la orden en Odoo
+                            domain = [('name', '=', reserva)]
+                            sale_order_ids = models.execute_kw(db, uid, password, 'sale.order', 'search', [domain])
+                            
+                            if not sale_order_ids:
+                                orders_data.append({
+                                    'Reserva': reserva,
+                                    'Puede_Procesar': False,
+                                    'Motivo': 'Orden no encontrada en Odoo',
+                                    'Estado': 'No encontrado',
+                                    'Estado_Factura': 'N/A'
+                                })
+                                continue
+                                
+                            # Obtener detalles de la orden
+                            # Usamos try-except para manejar posibles errores de tipo
+                            try:
+                                order_id = sale_order_ids[0] if isinstance(sale_order_ids, list) and len(sale_order_ids) > 0 else 0
+                                sale_order = models.execute_kw(db, uid, password, 'sale.order', 'read',
+                                    [order_id], {'fields': ['state', 'invoice_status']})
+                            except (TypeError, IndexError) as e:
+                                st.error(f"Error al obtener detalles de la orden {reserva}: {str(e)}")
+                                sale_order = []
+                            
+                            if not sale_order or not isinstance(sale_order, list) or len(sale_order) == 0:
+                                orders_data.append({
+                                    'Reserva': reserva,
+                                    'Puede_Procesar': False,
+                                    'Motivo': 'No se pudieron obtener detalles de la orden',
+                                    'Estado': 'Error',
+                                    'Estado_Factura': 'N/A'
+                                })
+                                continue
+                                
+                            sale_order_data = sale_order[0]
+                            
+                            # Verificar si la orden puede ser procesada
+                            puede_procesar = True
+                            motivo = ''
+                            
+                            state = sale_order_data.get('state', '')
+                            invoice_status = sale_order_data.get('invoice_status', '')
+                            
+                            if state not in ['sale', 'done']:
+                                puede_procesar = False
+                                motivo = f"Estado de orden inválido: {state}"
+                                
+                            orders_data.append({
+                                'Reserva': reserva,
+                                'Puede_Procesar': puede_procesar,
+                                'Motivo': motivo,
+                                'Estado': state,
+                                'Estado_Factura': invoice_status
+                            })
+                        except Exception as e:
+                            st.error(f"Error al verificar estado de orden {reserva}: {str(e)}")
+                            orders_data.append({
+                                'Reserva': reserva,
+                                'Puede_Procesar': False,
+                                'Motivo': f"Error: {str(e)}",
+                                'Estado': 'Error',
+                                'Estado_Factura': 'Error'
+                            })
+                    
+                    # Crear DataFrame con los estados de las órdenes
+                    orders_status_df = pd.DataFrame(orders_data)
 
-                    results = []
                     for index, row in df.iterrows():
                         # Actualizar progreso general
-                        progress_percent = (index) / len(df)
-                        overall_progress.progress(progress_percent)
-                        overall_status.info(f"Procesando registro {index + 1} de {len(df)} ({int(progress_percent * 100)}%)")
-
+                        try:
+                            # Convertir explícitamente a tipos numéricos para evitar errores de tipo
+                            df_len = len(df) if hasattr(df, '__len__') else 0
+                            if df_len > 0:
+                                progress_percent = float(index) / float(df_len)
+                            else:
+                                progress_percent = 0.0
+                            overall_progress.progress(progress_percent)
+                            overall_status.info(f"Procesando registro {int(index) + 1} de {df_len} ({int(progress_percent * 100)}%)")
+                        except Exception as e:
+                            st.warning(f"Error al actualizar progreso: {str(e)}")
+                            overall_progress.progress(0)
+                            overall_status.info("Procesando registros...")
+                        
+                        # Formatear la fecha
+                        fecha_pago = None
+                        try:
+                            # Verificar si el valor existe y no es NaN
+                            if 'Fecha Pago' in row and pd.notna(row['Fecha Pago']):
+                                # Intentar formatear la fecha
+                                if hasattr(row['Fecha Pago'], 'strftime'):
+                                    fecha_pago = row['Fecha Pago'].strftime('%Y-%m-%d')
+                                else:
+                                    fecha_pago = str(row['Fecha Pago'])
+                        except Exception as e:
+                            st.warning(f"Error al formatear fecha: {str(e)}")
+                            fecha_pago = "Fecha no válida"
+                        
                         # Mostrar información del registro actual
-                        current_record_info.info(f"Procesando: Reserva {row['Reserva']} - {row['Fecha Pago'].strftime('%d-%m-%Y')} - {row['Forma de Pago']} - ${row['Monto Abono']}")
-
+                        try:
+                            reserva = str(row.get('Reserva', 'N/A')) if hasattr(row, 'get') else str(row['Reserva'] if 'Reserva' in row else 'N/A')
+                            forma_pago = str(row.get('Forma de Pago', 'N/A')) if hasattr(row, 'get') else str(row['Forma de Pago'] if 'Forma de Pago' in row else 'N/A')
+                            monto = str(row.get('Monto Abono', 0)) if hasattr(row, 'get') else str(row['Monto Abono'] if 'Monto Abono' in row else 0)
+                            current_record_info.info(f"Procesando: Reserva {reserva} - {fecha_pago} - {forma_pago} - ${monto}")
+                        except Exception as e:
+                            st.warning(f"Error al mostrar información del registro: {str(e)}")
+                            current_record_info.info("Procesando registro...")
+                        
+                        
                         # Resetear progreso del registro
                         record_progress.progress(0)
                         current_step_info.info("Iniciando procesamiento...")
@@ -860,14 +1059,48 @@ def main():
                     # Completar progreso general
                     overall_progress.progress(1.0)
                     overall_status.success(f"✅ Procesamiento completado: {len(df)} registros")
-
-                    # Guardar log completo
+                    
+                    # Guardar log completo y resultados en la sesión
                     log_file = "\n".join(log_entries)
+                    st.session_state['log_file'] = log_file
+                    
+                    # Crear DataFrame con los resultados
+                    results_df = pd.DataFrame(results)
+                    
+                    # Guardar en session_state antes de calcular métricas para evitar errores de lint
+                    st.session_state['results_df'] = results_df
+                    
+                    # Calcular las métricas
+                    if isinstance(results_df, pd.DataFrame) and not results_df.empty:
+                        total_processed = len(results_df)
+                        facturas_creadas = len(results_df[results_df['Factura'] != 'No'])
+                        pagos_registrados = len(results_df[results_df['Pago'] == 'Registrado'])
+                        conciliaciones_exitosas = len(results_df[results_df['Conciliación'] == 'Si'])
+                        ordenes_omitidas = len(results_df[results_df['Status'] == 'Omitido'])
+                        processed_orders = len(results_df[results_df['Status'] != 'Omitido'])
+                        success_rate = round(len(results_df[results_df['Status'] == 'Éxito']) / max(processed_orders, 1) * 100, 2)
+                        
+                        # Guardar todos los datos necesarios para mantener la vista de resultados
+                        st.session_state['processing_results'] = {
+                            'log_file': log_file,
+                            'total_processed': total_processed,
+                            'facturas_creadas': facturas_creadas,
+                            'pagos_registrados': pagos_registrados,
+                            'conciliaciones_exitosas': conciliaciones_exitosas,
+                            'ordenes_omitidas': ordenes_omitidas,
+                            'success_rate': success_rate
+                        }
+                        
+                        # Marcar que el procesamiento está completo
+                        st.session_state['processing_complete'] = True
+                    
+                    # Botón de descarga que usa los datos guardados en la sesión
                     st.download_button(
                         label="Descargar Log Completo",
                         data=log_file.encode('utf-8'),
                         file_name="log_procesamiento.txt",
-                        mime="text/plain"
+                        mime="text/plain",
+                        key="download_log"
                     )
 
                     # Mostrar resultados
@@ -917,8 +1150,23 @@ def main():
                         label="Descargar Resultados",
                         data=results_df.to_csv(index=False).encode('utf-8'),
                         file_name="resultados_importacion.csv",
-                        mime="text/csv"
+                        mime="text/csv",
+                        key="download_results"
                     )
+                    
+                    # Marcar el procesamiento como completo para mantener los resultados visibles
+                    st.session_state['processing_complete'] = True
+                    
+                    # Botón para iniciar una nueva carga de datos
+                    st.write("")
+                    st.write("")
+                    if st.button("Iniciar una nueva carga de datos", key="new_upload"):
+                        # Reiniciar el estado pero mantener las credenciales de sesión
+                        for key in ['orders_status_df', 'validation_complete', 'show_process_button', 
+                                  'processing_complete', 'processing_results', 'log_file', 'results_df']:
+                            if key in st.session_state:
+                                del st.session_state[key]
+                        st.experimental_rerun()
 
         except Exception as e:
             st.error(f"Error al procesar el archivo: {str(e)}")
