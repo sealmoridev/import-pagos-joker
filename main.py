@@ -6,6 +6,9 @@ import pytz
 import time
 import re
 import os
+import base64
+import io
+import openpyxl
 from dotenv import load_dotenv
 
 # Cargar variables de entorno desde .env si existe
@@ -85,7 +88,7 @@ def validate_excel_format(df):
 
     # Obtener los valores válidos para Forma de Pago del mapping
     valid_payment_methods = {
-        'TRANSF', 'DEP', 'BEX', 'CV', 'IN', 'SBE', 'EFECT OF', 'MAQ/TD', 'MAQ/TC', 'WEBPAY'
+        'TRANSF', 'DEP', 'BEX', 'CV', 'IN', 'SBE', 'EFECT OF', 'MAQ/TD', 'MAQ/TC', 'WEBPAY', 'IPS'
     }
 
     # Recorrer cada fila y validar
@@ -176,6 +179,10 @@ def validate_orders_status(models, db, uid, password, df):
         reserva = str(row['Reserva']).strip()
         status_container.info(f"Validando orden {reserva} ({index + 1}/{len(df)})...")
 
+        # Obtener información del pago
+        es_pago_total = int(row.get('Pago', 0)) == 1
+        monto_abono = float(row.get('Monto Abono', 0))
+
         # Buscar la orden en Odoo
         domain = [('name', '=', reserva)]
         sale_order_ids = models.execute_kw(db, uid, password, 'sale.order', 'search', [domain])
@@ -193,27 +200,49 @@ def validate_orders_status(models, db, uid, password, df):
         else:
             # La orden existe, verificar su estado
             sale_order = models.execute_kw(db, uid, password, 'sale.order', 'read',
-                [sale_order_ids[0]], {'fields': ['state', 'invoice_status']})[0]
+                [sale_order_ids[0]], {'fields': ['state', 'invoice_status', 'amount_total']})[0]
 
-            # Verificar si el estado de facturación es 'to invoice'
-            can_process = sale_order.get('invoice_status') == 'to invoice'
+            # Verificar si el estado de facturación es 'to invoice' o si es un pago parcial con factura ya creada
+            invoice_status = sale_order.get('invoice_status')
+            monto_total_orden = float(sale_order.get('amount_total', 0))
+            
+            # Caso especial: Pago parcial (Pago=0) y la orden ya tiene factura (invoice_status='invoiced')
+            es_caso_especial = not es_pago_total and invoice_status == 'invoiced'
+            
+            # Puede procesar si: (estado normal para facturar) O (caso especial de pago parcial con factura)
+            can_process = (invoice_status == 'to invoice') or es_caso_especial
 
             motivo = ""
             if not can_process:
-                if sale_order.get('invoice_status') == 'invoiced':
-                    motivo = "Orden ya facturada"
-                elif sale_order.get('invoice_status') == 'no':
+                if invoice_status == 'invoiced' and es_pago_total:
+                    motivo = "Orden ya facturada y se intenta hacer un pago total"
+                elif invoice_status == 'no':
                     motivo = "Orden no requiere facturación"
-                elif sale_order.get('invoice_status') == 'upselling':
+                elif invoice_status == 'upselling':
                     motivo = "Orden en estado de venta adicional"
                 else:
-                    motivo = f"Estado de facturación no válido: {sale_order.get('invoice_status')}"
+                    motivo = f"Estado de facturación no válido: {invoice_status}"
+            # Validar que si es pago total, el monto coincida con el total de la orden
+            elif es_pago_total and abs(monto_abono - monto_total_orden) > 0.01:  # Tolerancia de 0.01 para errores de redondeo
+                can_process = False
+                motivo = f"El monto del pago total ({monto_abono}) no coincide con el total de la orden ({monto_total_orden})"
+            
+            # Agregar información adicional para el caso especial
+            if es_caso_especial and can_process:
+                motivo = "Pago parcial para orden ya facturada - Se asociará a la factura existente"
 
+            # Formatear montos para visualización (solo para mostrar en la tabla)
+            monto_total_formato = f"${monto_total_orden:,.0f}"
+            monto_abono_formato = f"${monto_abono:,.0f}"
+            
             orders_info.append({
                 'Reserva': reserva,
                 'Existe': True,
                 'Estado': sale_order.get('state', 'N/A'),
                 'Estado_Factura': sale_order.get('invoice_status', 'N/A'),
+                'Monto_Total': monto_total_formato,  # Formato para visualización
+                'Monto_Abono': monto_abono_formato,  # Formato para visualización
+                'Es_Pago_Total': 'Sí' if es_pago_total else 'No',
                 'Puede_Procesar': can_process,
                 'Motivo': motivo if not can_process else "OK"
             })
@@ -313,7 +342,8 @@ def get_journal_id(payment_method):
         'EFECT OF': 6,# ID del diario de Efectivo
         'MAQ/TD': 7,  # ID del diario de Transbank Débito
         'MAQ/TC': 7,   # ID del diario de Transbank Crédito
-        'WEBPAY': 7   # ID del diario de Webpay
+        'WEBPAY': 7,   # ID del diario de Webpay
+        'IPS': 7   # ID del diario de IPS
     }
     return journal_mapping.get(payment_method, 7)
 
@@ -414,76 +444,148 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
 
     Args:
         update_step: Función para actualizar el paso actual en el log
+        
+    Nota:
+        Si row['Pago'] = 1: Se valida que el monto del abono coincida con el total de la orden
+        Si row['Pago'] = 0: Se permite un pago parcial (monto del abono puede ser menor al total)
+        
+    Caso especial:
+        Si row['Pago'] = 0 y la orden ya está facturada (invoice_status='invoiced'):
+        Se busca la factura existente y se asocia el pago a ella sin crear una nueva factura
     """
-    try:
-        # Inicializar el avance
-        current_step = 0
-        progress_bar.progress(current_step * progress_step)
+    # Inicializar el avance
+    current_step = 0
+    progress_bar.progress(current_step * progress_step)
 
-        # Preparar datos básicos
-        reserva = str(row['Reserva']).strip()
-        update_step(f"🔍 Validando orden de venta: {reserva}")
+    # Preparar datos básicos
+    reserva = str(row['Reserva']).strip()
+    reserva_clean = str(row['Reserva_Clean']).strip() if 'Reserva_Clean' in row else reserva
+    
+    # Obtener la fila correspondiente en el DataFrame de validación (solo para información)
+    order_status_rows = orders_status_df[orders_status_df['Reserva_Str'].astype(str).str.strip() == reserva_clean]
+    if len(order_status_rows) > 0:
+        order_status = order_status_rows.iloc[0]
+    else:
+        # Esto no debería ocurrir nunca con la nueva implementación
+        order_status = {'Estado': 'Desconocido', 'Estado_Factura': 'Desconocido'}
 
-        # Verificar si la orden puede ser procesada
-        order_status = orders_status_df[orders_status_df['Reserva'] == reserva].iloc[0]
+    # Buscar la orden de venta
+    update_step(f"🔍 Buscando orden de venta: {reserva}")
+    domain = [('name', '=', reserva)]
+    sale_order_ids = models.execute_kw(db, uid, password, 'sale.order', 'search', [domain])
 
-        if not order_status['Puede_Procesar']:
-            update_step(f"⚠️ Orden {reserva} no puede ser procesada: {order_status['Motivo']}")
-            return {
-                'Reserva': reserva,
-                'Status': 'Omitido',
-                'Mensaje': f"No procesado: {order_status['Motivo']}",
-                'Estado_Orden': order_status['Estado'],
-                'Estado_Factura': order_status['Estado_Factura'],
-                'Factura': 'No',
-                'Pago': 'No',
-                'Conciliación': 'No'
-            }
+    current_step += 1
+    progress_bar.progress(current_step * progress_step)
 
-        current_step += 1
-        progress_bar.progress(current_step * progress_step)
+    # Obtener detalles de la orden
+    update_step("📋 Obteniendo detalles de la orden...")
+    sale_order = models.execute_kw(db, uid, password, 'sale.order', 'read',
+        [sale_order_ids[0]], {'fields': ['partner_id', 'amount_total', 'invoice_status']})[0]
 
-        # Buscar la orden de venta
-        update_step(f"🔍 Buscando orden de venta: {reserva}")
-        domain = [('name', '=', reserva)]
-        sale_order_ids = models.execute_kw(db, uid, password, 'sale.order', 'search', [domain])
+    current_step += 1
+    progress_bar.progress(current_step * progress_step)
 
-        current_step += 1
-        progress_bar.progress(current_step * progress_step)
+    if not sale_order.get('partner_id'):
+        update_step("❌ Orden sin cliente asociado")
+        return {
+            'Reserva': reserva,
+            'Status': 'Error',
+            'Mensaje': 'Orden sin cliente asociado',
+            'Estado_Orden': order_status['Estado'],
+            'Estado_Factura': order_status['Estado_Factura'],
+            'Factura': 'No',
+            'Pago': 'No',
+            'Conciliación': 'No'
+        }
 
-        # Obtener detalles de la orden
-        update_step("📋 Obteniendo detalles de la orden...")
-        sale_order = models.execute_kw(db, uid, password, 'sale.order', 'read',
-            [sale_order_ids[0]], {'fields': ['partner_id', 'amount_total', 'invoice_status']})[0]
+    # Obtener líneas de la orden
+    update_step("📊 Obteniendo líneas de la orden...")
+    order_lines = get_order_lines(models, db, uid, password, sale_order_ids[0])
 
-        current_step += 1
-        progress_bar.progress(current_step * progress_step)
+    current_step += 1
+    progress_bar.progress(current_step * progress_step)
 
-        if not sale_order.get('partner_id'):
-            update_step("❌ Orden sin cliente asociado")
+    # Preparar datos básicos
+    partner_id = sale_order['partner_id'][0]
+    invoice_date = convert_to_odoo_date(row['Fecha Pago'])
+    monto = float(row['Monto Abono'])
+    payment_method = str(row['Forma de Pago']).strip()
+    journal_id = get_journal_id(payment_method)
+    formatted_date = format_date(row['Fecha Pago'])
+        
+    # Verificar si es pago total o parcial
+    es_pago_parcial = row['Pago'] == 0
+    total_orden = float(sale_order['amount_total'])
+    
+    # Validar monto si es pago total (Pago=1)
+    if not es_pago_parcial and abs(monto - total_orden) > 0.01:  # Tolerancia de 0.01 para errores de redondeo
+        update_step(f"⚠️ Advertencia: Pago marcado como total pero el monto ({monto}) no coincide con el total de la orden ({total_orden})")
+        # Continuamos de todas formas, pero dejamos la advertencia en el log
+
+    # Verificar si es un caso especial: pago parcial para orden ya facturada
+    es_caso_especial = es_pago_parcial and sale_order.get('invoice_status') == 'invoiced'
+    invoice_id = None
+    payment_data = None
+    memo = ""
+
+    if es_caso_especial:
+        # Manejar caso especial: buscar factura existente para pago parcial en orden ya facturada
+        update_step("🔍 Buscando factura existente para la orden...")
+        # Buscar facturas relacionadas con la orden
+        domain = [
+            ('invoice_origin', '=', reserva),
+            ('move_type', '=', 'out_invoice'),
+            ('state', '=', 'posted')
+        ]
+        existing_invoice_ids = models.execute_kw(db, uid, password, 'account.move', 'search', [domain])
+        
+        if not existing_invoice_ids:
+            update_step("⚠️ No se encontraron facturas existentes para la orden")
             return {
                 'Reserva': reserva,
                 'Status': 'Error',
-                'Mensaje': 'Orden sin cliente asociado',
+                'Mensaje': 'No se encontraron facturas existentes para la orden',
                 'Estado_Orden': order_status['Estado'],
                 'Estado_Factura': order_status['Estado_Factura'],
                 'Factura': 'No',
                 'Pago': 'No',
                 'Conciliación': 'No'
             }
-
-        # Obtener líneas de la orden
-        update_step("📊 Obteniendo líneas de la orden...")
-        order_lines = get_order_lines(models, db, uid, password, sale_order_ids[0])
-
-        current_step += 1
+        
+        # Usar la primera factura encontrada
+        invoice_id = existing_invoice_ids[0]
+        invoice_data = models.execute_kw(db, uid, password, 'account.move', 'read', 
+                                      [invoice_id], {'fields': ['name', 'amount_total', 'amount_residual']})[0]
+        
+        update_step(f"✅ Factura existente encontrada: {invoice_data['name']}")
+        update_step(f"Total factura: ${invoice_data['amount_total']}, Pendiente: ${invoice_data['amount_residual']}")
+        
+        # Preparar memo para el pago
+        memo = f"{reserva} / {payment_method}/{formatted_date} (PAGO PARCIAL ADICIONAL)"
+        update_step(f"💰 Procesando pago PARCIAL ADICIONAL por ${monto} para factura existente")
+        
+        # Avanzar los pasos para mantener la barra de progreso
+        current_step += 3
         progress_bar.progress(current_step * progress_step)
-
-        # Preparar datos básicos
-        partner_id = sale_order['partner_id'][0]
-        invoice_date = convert_to_odoo_date(row['Fecha Pago'])
-        monto = float(row['Monto Abono'])
-
+        update_step("✅ Usando factura existente, no es necesario crear una nueva")
+        
+        # Preparar payment_data para el caso especial
+        payment_data = {
+            'amount': monto,
+            'date': invoice_date,
+            'journal_id': journal_id,
+            'memo': memo
+        }
+    else:
+        # Caso normal: crear factura y registrar pago
+        # Preparar datos para el memo
+        if es_pago_parcial:
+            memo = f"{reserva} / {payment_method}/{formatted_date} (PAGO PARCIAL)"
+            update_step(f"💰 Procesando pago PARCIAL por ${monto} de un total de ${total_orden}")
+        else:
+            memo = f"{reserva} / {payment_method}/{formatted_date}"
+            update_step(f"💰 Procesando pago TOTAL por ${monto}")
+        
         # Crear líneas de factura
         update_step("📝 Preparando líneas de factura...")
         invoice_lines = []
@@ -561,14 +663,9 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
         except Exception as e:
             update_step(f"⚠️ Error al actualizar la orden de venta: {str(e)}")
 
+        # Registrar el pago para la factura (sea existente o recién creada)
         current_step += 1
         progress_bar.progress(current_step * progress_step)
-
-        # Preparar datos del pago
-        payment_method = str(row['Forma de Pago']).strip()
-        journal_id = get_journal_id(payment_method)
-        formatted_date = format_date(row['Fecha Pago'])
-        memo = f"{reserva} / {payment_method}/{formatted_date}"
 
         payment_data = {
             'amount': monto,
@@ -577,58 +674,105 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
             'memo': memo
         }
 
-        update_step("💰 Registrando pago...")
+    # Registrar el pago para la factura (sea existente o recién creada)
+    update_step("💰 Registrando pago...")
 
+    current_step += 1
+    progress_bar.progress(current_step * progress_step)
+
+    if register_payment_from_invoice(models, db, uid, password, invoice_id, payment_data, update_step):
+        current_step += 1
+        progress_bar.progress(1.0)  # Completar la barra
+        update_step("✅ Proceso completado exitosamente")
+        # Determinar estado del pago
+        estado_pago = 'Parcial' if es_pago_parcial else 'Total'
+        
+        return {
+            'Reserva': reserva,
+            'Status': 'Éxito',
+            'Mensaje': f'Proceso completado exitosamente (Pago {estado_pago})',
+            'Estado_Orden': order_status['Estado'],
+            'Estado_Factura': 'invoiced',  # Ahora está facturado
+            'Factura': str(invoice_id),
+            'Pago': estado_pago,
+            'Conciliación': 'Si'
+        }
+    else:
         current_step += 1
         progress_bar.progress(current_step * progress_step)
-
-        if register_payment_from_invoice(models, db, uid, password, invoice_id, payment_data, update_step):
-            current_step += 1
-            progress_bar.progress(1.0)  # Completar la barra
-            update_step("✅ Proceso completado exitosamente")
-            return {
-                'Reserva': reserva,
-                'Status': 'Éxito',
-                'Mensaje': 'Proceso completado exitosamente',
-                'Estado_Orden': order_status['Estado'],
-                'Estado_Factura': 'invoiced',  # Ahora está facturado
-                'Factura': str(invoice_id),
-                'Pago': 'Registrado',
-                'Conciliación': 'Si'
-            }
-        else:
-            current_step += 1
-            progress_bar.progress(current_step * progress_step)
-            update_step("⚠️ Factura creada, error al registrar pago")
-            return {
-                'Reserva': reserva,
-                'Status': 'Parcial',
-                'Mensaje': 'Factura creada, error al registrar pago',
-                'Estado_Orden': order_status['Estado'],
-                'Estado_Factura': 'invoiced',  # Parcialmente facturado
-                'Factura': str(invoice_id),
-                'Pago': 'No',
-                'Conciliación': 'No'
-            }
-
-    except Exception as e:
-        update_step(f"❌ Error general: {str(e)}")
-        estado_orden = order_status['Estado'] if 'order_status' in locals() else 'N/A'
-        estado_factura = order_status['Estado_Factura'] if 'order_status' in locals() else 'N/A'
+        update_step("⚠️ Factura creada, error al registrar pago")
         return {
-            'Reserva': str(row.get('Reserva', 'Desconocido')),
-            'Status': 'Error',
-            'Mensaje': str(e),
-            'Estado_Orden': estado_orden,
-            'Estado_Factura': estado_factura,
-            'Factura': 'No',
+            'Reserva': reserva,
+            'Status': 'Parcial',
+            'Mensaje': 'Factura creada, error al registrar pago',
+            'Estado_Orden': order_status['Estado'],
+            'Estado_Factura': 'invoiced',  # Parcialmente facturado
+            'Factura': str(invoice_id),
             'Pago': 'No',
             'Conciliación': 'No'
         }
 
+def generate_excel_template():
+    """Genera un template de Excel con datos de ejemplo"""
+    # Crear un DataFrame con las columnas requeridas y un registro de ejemplo
+    df = pd.DataFrame([
+        {
+            'Fecha Pago': '01/09/2025',
+            'Reserva': 'S12345',
+            'Pago': 1,  # 1 = Pago total, 0 = Pago parcial
+            'Forma de Pago': 'TRANSF',
+            'Monto Abono': 150000
+        },
+        {
+            'Fecha Pago': '02/09/2025',
+            'Reserva': 'S12346',
+            'Pago': 0,  # Ejemplo de pago parcial
+            'Forma de Pago': 'DEP',
+            'Monto Abono': 75000
+        }
+    ])
+    
+    # Crear un archivo temporal
+    temp_file = 'template_pagos_temp.xlsx'
+    
+    # Guardar el DataFrame como Excel
+    df.to_excel(temp_file, index=False)
+    
+    # Leer el archivo como bytes
+    with open(temp_file, 'rb') as f:
+        data = f.read()
+    
+    # Eliminar el archivo temporal
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
+    
+    return data
+
 def main():
     st.title("Importación de Pagos a Odoo")
-
+    
+    # Crear una sección para el template
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Formato de Archivo")
+    st.sidebar.info("""
+    Para importar pagos, necesitas un archivo Excel con las siguientes columnas:
+    - **Fecha Pago**: Fecha en formato DD/MM/AAAA
+    - **Reserva**: Código de reserva Ej: S12345 (máx. 6 caracteres)
+    - **Pago**: 1 = Pago total, 0 = Pago parcial
+    - **Forma de Pago**: TRANSF, DEP, BEX, CV, IN, SBE, EFECT OF, MAQ/TD, MAQ/TC, WEBPAY, IPS
+    - **Monto Abono**: Valor numérico del pago
+    """)
+    
+    # Añadir botón para descargar template en el sidebar
+    excel_data = generate_excel_template()
+    st.sidebar.download_button(
+        label="📥 Descargar Template Excel",
+        data=excel_data,
+        file_name="template_pagos.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Descarga un archivo Excel con el formato correcto y ejemplos para importar pagos"
+    )
+    
     # Mostrar formulario de login y obtener credenciales
     url, db, username, password = show_login_form()
 
@@ -692,13 +836,17 @@ def main():
             # Función para colorear las filas según el resultado
             def highlight_status(row):
                 if row['Status'] == 'Éxito':
-                    return ['background-color: #CCFFCC'] * len(row)
+                    # Diferenciar entre pagos totales y parciales
+                    if row['Pago'] == 'Parcial':
+                        return ['background-color: #E6FFCC'] * len(row)  # Verde más claro para pagos parciales
+                    else:
+                        return ['background-color: #CCFFCC'] * len(row)  # Verde estándar para pagos totales
                 elif row['Status'] == 'Parcial':
-                    return ['background-color: #FFFFCC'] * len(row)
+                    return ['background-color: #FFFFCC'] * len(row)  # Amarillo para éxito parcial (factura sin pago)
                 elif row['Status'] == 'Omitido':
-                    return ['background-color: #EFEFEF'] * len(row)
+                    return ['background-color: #EFEFEF'] * len(row)  # Gris para omitidos
                 else:
-                    return ['background-color: #FFCCCC'] * len(row)
+                    return ['background-color: #FFCCCC'] * len(row)  # Rojo para errores
             
             # Mostrar el dataframe con los resultados
             if isinstance(results_df, pd.DataFrame) and not results_df.empty:
@@ -832,12 +980,18 @@ def main():
                     mime="text/csv"
                 )
 
-                # Solo mostrar el botón de procesar si hay órdenes válidas
-                if valid_orders > 0:
+                # Solo mostrar el botón de procesar cuando TODAS las órdenes sean válidas (100%)
+                if valid_orders > 0 and valid_orders == total_orders and invalid_orders == 0:
                     st.session_state['orders_status_df'] = orders_status_df
                     st.session_state['validation_complete'] = True
-                    st.success(f"✅ {valid_orders} órdenes están listas para procesar.")
-                    st.session_state['show_process_button'] = True
+                    st.success(f"✅ Todas las {total_orders} órdenes están listas para procesar.")
+                    st.info("💡 **Recomendación**: Puede limpiar la base de datos antes de procesar si lo desea.")
+                    st.session_state['show_process_button'] = True  # Mostrar botón solo cuando 100% están aptos
+                elif valid_orders > 0:
+                    st.session_state['orders_status_df'] = orders_status_df
+                    st.session_state['validation_complete'] = True
+                    st.warning(f"⚠️ Solo {valid_orders} de {total_orders} órdenes están listas para procesar. Corrija los {invalid_orders} registros con problemas antes de continuar.")
+                    st.session_state['show_process_button'] = False  # Ocultar botón cuando hay registros mixtos
                 else:
                     st.warning("⚠️ No hay órdenes válidas para procesar. Corrija los problemas identificados e intente nuevamente.")
                     st.session_state['show_process_button'] = False
@@ -952,15 +1106,61 @@ def main():
                             sale_order_data = sale_order[0]
                             
                             # Verificar si la orden puede ser procesada
-                            puede_procesar = True
+                            puede_procesar = True  # Por defecto, asumimos que es procesable
                             motivo = ''
                             
                             state = sale_order_data.get('state', '')
                             invoice_status = sale_order_data.get('invoice_status', '')
                             
+                            # Verificar estado de la orden
                             if state not in ['sale', 'done']:
                                 puede_procesar = False
                                 motivo = f"Estado de orden inválido: {state}"
+                            
+                            # Verificar si hay un monto de abono válido
+                            try:
+                                # Asegurar que el valor existe y es convertible a float
+                                if 'Monto Abono' in row and row['Monto Abono'] is not None:
+                                    monto_abono = float(row['Monto Abono'])
+                                    if monto_abono <= 0:
+                                        puede_procesar = False
+                                        motivo = "Monto de abono inválido o cero"
+                                else:
+                                    puede_procesar = False
+                                    motivo = "No se encontró monto de abono"
+                            except (ValueError, TypeError):
+                                puede_procesar = False
+                                motivo = "Monto de abono no es un número válido"
+                                
+                            # Verificar si la orden ya está pagada completamente
+                            if invoice_status == 'invoiced':
+                                # Verificar si es pago total
+                                es_pago_total = False
+                                if isinstance(row, dict) and 'Pago' in row:
+                                    try:
+                                        if int(row['Pago']) == 1:
+                                            es_pago_total = True
+                                    except (ValueError, TypeError):
+                                        pass
+                                
+                                if es_pago_total:
+                                    # Obtener facturas de la orden
+                                    try:
+                                        invoice_ids = models.execute_kw(db, uid, password, 'account.move', 'search',
+                                                                    [[('invoice_origin', '=', reserva), ('move_type', '=', 'out_invoice')]])
+                                        if invoice_ids:
+                                            invoice_data = models.execute_kw(db, uid, password, 'account.move', 'read',
+                                                                        [invoice_ids[0]], {'fields': ['payment_state']})
+                                            if invoice_data and isinstance(invoice_data, list) and len(invoice_data) > 0:
+                                                invoice_info = invoice_data[0]
+                                                if isinstance(invoice_info, dict) and 'payment_state' in invoice_info:
+                                                    if invoice_info['payment_state'] == 'paid':
+                                                        puede_procesar = False
+                                                        motivo = "La orden ya está completamente pagada"
+                                    except Exception as e:
+                                        # Si hay error al verificar, permitimos procesar pero lo registramos
+                                        st.warning(f"Advertencia al verificar pagos de {reserva}: {str(e)}")
+                            
                                 
                             orders_data.append({
                                 'Reserva': reserva,
@@ -982,21 +1182,97 @@ def main():
                     # Crear DataFrame con los estados de las órdenes
                     orders_status_df = pd.DataFrame(orders_data)
 
-                    for index, row in df.iterrows():
+                    # Filtrar solo las órdenes que pueden ser procesadas
+                    # Asegurar que todas las reservas están en formato string limpio para comparación
+                    orders_status_df['Reserva_Str'] = orders_status_df['Reserva'].astype(str).str.strip()
+                    
+                    # Verificar explícitamente que Puede_Procesar sea True (no solo truthy)
+                    # Esto evita problemas con valores que podrían evaluarse como True pero no son exactamente True
+                    procesable_df = orders_status_df[orders_status_df['Puede_Procesar'].apply(lambda x: x is True)]
+                    procesable_orders = procesable_df['Reserva_Str'].tolist()
+                    
+                    # Log de depuración - Órdenes procesables (eliminado - ya no necesario)
+                    # Solo procesar órdenes validadas
+                    
+                    # Filtrar el DataFrame original para incluir solo órdenes procesables
+                    # Convertir las reservas a string y eliminar espacios para comparación exacta
+                    df['Reserva_Clean'] = df['Reserva'].astype(str).str.strip()
+                    df_procesable = df[df['Reserva_Clean'].isin(procesable_orders)].copy()
+                    
+                    # Guardar el DataFrame de validación en la sesión para usarlo en el paso de procesamiento
+                    st.session_state['orders_status_df'] = orders_status_df
+                    
+                    # Guardar el DataFrame filtrado en la sesión
+                    st.session_state['df_procesable'] = df_procesable
+                    
+                    # Calcular estadísticas
+                    total_registros = len(df)
+                    registros_procesables = len(df_procesable)
+                    registros_filtrados = total_registros - registros_procesables
+                    
+                    if registros_procesables == 0:
+                        st.error("\u274c No hay registros procesables. Por favor, revise los datos y vuelva a intentarlo.")
+                        return
+                    
+                    # NUEVO: Impedir procesar si hay registros no procesables
+                    if registros_filtrados > 0:
+                        st.error(f"⛔ No se puede continuar. Hay {registros_filtrados} registros que no son procesables.")
+                        st.warning("Para continuar, todos los registros deben ser procesables. Por favor, corrija los errores o elimine los registros con problemas del archivo Excel.")
+                        
+                        # Mostrar qué registros fueron filtrados con sus motivos
+                        registros_no_procesables = df[~df['Reserva_Clean'].isin(procesable_orders)]
+                        st.write("### Registros no procesables:")
+                        
+                        # Unir con el DataFrame de validación para mostrar los motivos
+                        registros_no_procesables['Reserva_Str'] = registros_no_procesables['Reserva_Clean']
+                        merged_df = pd.merge(
+                            registros_no_procesables[['Reserva', 'Reserva_Str', 'Monto Abono']], 
+                            orders_status_df[['Reserva_Str', 'Motivo']], 
+                            on='Reserva_Str',
+                            how='left'
+                        )
+                        
+                        st.dataframe(merged_df[['Reserva', 'Monto Abono', 'Motivo']])
+                        return
+                    
+                    # NO modificar el DataFrame orders_status_df original, ya que contiene la información completa de validación
+                    # En su lugar, usar el DataFrame filtrado procesable_df para el procesamiento
+                    
+                    # Confirmar que solo se procesarán los registros correctos
+                    st.success(f"Se procesarán únicamente {registros_procesables} registros válidos.")
+                    
+                    # Reiniciar contadores y variables para el procesamiento
+                    results = []
+                    log_entries = []
+                    processed = 0
+                    successful = 0
+                    errors = 0
+                    
+                    for index, row in df_procesable.iterrows():
                         # Actualizar progreso general
                         try:
                             # Convertir explícitamente a tipos numéricos para evitar errores de tipo
-                            df_len = len(df) if hasattr(df, '__len__') else 0
+                            df_len = len(df_procesable) if hasattr(df_procesable, '__len__') else 0
                             if df_len > 0:
-                                progress_percent = float(index) / float(df_len)
+                                # Asegurar que index sea un número
+                                idx_num = index if isinstance(index, (int, float)) else 0
+                                progress_percent = float(idx_num) / float(df_len)
+                                # Calcular el índice para mostrar (1-based)
+                                idx_display = int(idx_num) + 1 if isinstance(idx_num, (int, float)) else 1
+                                # Calcular el porcentaje para mostrar
+                                percent_display = int(progress_percent * 100)
                             else:
                                 progress_percent = 0.0
+                                idx_display = 1
+                                percent_display = 0
                             overall_progress.progress(progress_percent)
-                            overall_status.info(f"Procesando registro {int(index) + 1} de {df_len} ({int(progress_percent * 100)}%)")
+                            overall_status.info(f"Procesando registro {idx_display} de {df_len} ({percent_display}%)")
+
                         except Exception as e:
                             st.warning(f"Error al actualizar progreso: {str(e)}")
                             overall_progress.progress(0)
                             overall_status.info("Procesando registros...")
+
                         
                         # Formatear la fecha
                         fecha_pago = None
@@ -1036,9 +1312,15 @@ def main():
                             # Mostrar log actualizado (últimas 10 entradas)
                             log_placeholder.code("\n".join(log_entries[-10:]))
 
+                        # Log de depuración antes de procesar
+                        update_step_info(f"Procesando registro con reserva: {row['Reserva']} (Reserva_Clean: {row['Reserva_Clean']})")
+                        
                         # Procesar registro con función de actualización
                         result = process_record(models, db, uid, password, row, orders_status_df, 
                                              record_progress, progress_step, update_step_info)
+                        
+                        # Log del resultado
+                        update_step_info(f"Resultado del procesamiento: {result['Status']} - {result['Mensaje']}")
                         results.append(result)
 
                         # Actualizar contadores
@@ -1049,7 +1331,7 @@ def main():
                             errors += 1
 
                         # Actualizar estadísticas
-                        processed_counter.metric("Procesados", f"{processed}/{len(df)}")
+                        processed_counter.metric("Procesados", f"{processed}/{len(df_procesable)}")
                         success_counter.metric("Exitosos", successful)
                         error_counter.metric("Errores", errors)
 
@@ -1058,7 +1340,7 @@ def main():
 
                     # Completar progreso general
                     overall_progress.progress(1.0)
-                    overall_status.success(f"✅ Procesamiento completado: {len(df)} registros")
+                    overall_status.success(f"✅ Procesamiento completado: {len(df_procesable)} registros procesables de {len(df)} totales")
                     
                     # Guardar log completo y resultados en la sesión
                     log_file = "\n".join(log_entries)
@@ -1112,13 +1394,17 @@ def main():
                     # Función para colorear las filas según el resultado
                     def highlight_status(row):
                         if row['Status'] == 'Éxito':
-                            return ['background-color: #CCFFCC'] * len(row)
+                            # Diferenciar entre pagos totales y parciales
+                            if row['Pago'] == 'Parcial':
+                                return ['background-color: #E6FFCC'] * len(row)  # Verde más claro para pagos parciales
+                            else:
+                                return ['background-color: #CCFFCC'] * len(row)  # Verde estándar para pagos totales
                         elif row['Status'] == 'Parcial':
-                            return ['background-color: #FFFFCC'] * len(row)
+                            return ['background-color: #FFFFCC'] * len(row)  # Amarillo para éxito parcial (factura sin pago)
                         elif row['Status'] == 'Omitido':
-                            return ['background-color: #EFEFEF'] * len(row)
+                            return ['background-color: #EFEFEF'] * len(row)  # Gris para omitidos
                         else:
-                            return ['background-color: #FFCCCC'] * len(row)
+                            return ['background-color: #FFCCCC'] * len(row)  # Rojo para errores
 
                     st.dataframe(results_df.style.apply(highlight_status, axis=1))
 
