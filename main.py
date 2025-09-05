@@ -1,79 +1,83 @@
 import streamlit as st
 import pandas as pd
 import xmlrpc.client
+import os
 from datetime import datetime
+from dotenv import load_dotenv
+import io
 import pytz
 import time
 import re
-import os
-import base64
-import io
-import openpyxl
-from dotenv import load_dotenv
 
-# Cargar variables de entorno desde .env si existe
+# Importar configuración de navegación
+from app_config import setup_page_navigation, get_current_page
+
+# Importar componente del formateador IPS
+from components.formateador_ips.streamlit_component import render_ips_formatter
+
+# Cargar variables de entorno
 load_dotenv()
 
 def show_login_form():
     """Muestra el formulario de login y retorna las credenciales"""
-    st.sidebar.title("Inicio de Sesión")
-
-    # Obtener URL y DB desde variables de entorno
-    url = os.environ.get("ODOO_URL", "")
-    db = os.environ.get("ODOO_DB", "")
-    if not url or not db:
-        st.sidebar.error("⚠️ Configuración de Odoo incompleta. Defina ODOO_URL y ODOO_DB en el entorno o en el archivo .env.")
-        return None, None, None, None
-
+    # Obtener URL y DB desde variables de entorno (solo lectura)
+    url = os.getenv('ODOO_URL', '')
+    db = os.getenv('ODOO_DB', '')
     
-    # Formulario de login en el sidebar
-    with st.sidebar.form("login_form"):
-        st.write("Ingrese sus credenciales de Odoo")
+    if not url or not db:
+        st.error("⚠️ Configuración de Odoo incompleta. Defina ODOO_URL y ODOO_DB en el archivo .env.")
+        return None, None, None, None
+    
+    # Obtener credenciales de usuario desde session_state
+    default_username = st.session_state.get('odoo_username', '')
+    default_password = st.session_state.get('odoo_password', '')
+    
+    return url, db, default_username, default_password
 
-        # Mostrar la URL y DB como información pero no como entrada
-        st.info(f"Servidor: {url}")
+def connect_to_odoo():
+    """Conecta a Odoo usando las credenciales almacenadas"""
+    try:
+        url = st.session_state.get('odoo_url', '')
+        db = st.session_state.get('odoo_db', '')
+        username = st.session_state.get('odoo_username', '')
+        password = st.session_state.get('odoo_password', '')
         
-        # Campos del formulario
-        username = st.text_input("Usuario")
-        password = st.text_input("Contraseña", type="password")
-
-        # Botón de login
-        submit_button = st.form_submit_button("Iniciar Sesión")
-
-    # Verificar si se ha pulsado el botón de login
-    if submit_button:
-        if not username or not password:
-            st.sidebar.error("❌ Usuario y contraseña son requeridos")
+        if not all([url, db, username, password]):
             return None, None, None, None
-
-        # Guardar credenciales en sesión
-        st.session_state['odoo_url'] = url
-        st.session_state['odoo_db'] = db
-        st.session_state['odoo_username'] = username
-        st.session_state['odoo_password'] = password
-        st.session_state['is_logged_in'] = True
-
-        return url, db, username, password
-
-    # Si hay credenciales guardadas, devolverlas
-    if st.session_state.get('is_logged_in', False):
-        # Asegurarse de que url y db estén en la sesión, si no, usar los valores del entorno
-        session_url = st.session_state.get('odoo_url', url)
-        session_db = st.session_state.get('odoo_db', db)
         
-        # Si no hay url o db en la sesión ni en el entorno, mostrar error
-        if not session_url or not session_db:
-            st.sidebar.error("⚠️ Configuración de Odoo incompleta. Defina ODOO_URL y ODOO_DB.")
+        # Conectar a Odoo
+        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common')
+        uid = common.authenticate(db, username, password, {})
+        
+        if uid:
+            models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object')
+            return models, db, uid, password
+        else:
             return None, None, None, None
             
-        return (
-            session_url,
-            session_db,
-            st.session_state.get('odoo_username', ''),
-            st.session_state.get('odoo_password', '')
-        )
+    except Exception as e:
+        st.error(f"Error al conectar con Odoo: {str(e)}")
+        return None, None, None, None
 
-    return None, None, None, None
+def generate_excel_template():
+    """Genera un archivo Excel de ejemplo con el formato correcto"""
+    # Datos de ejemplo
+    data = {
+        'Fecha Pago': ['01/01/2024', '02/01/2024', '03/01/2024'],
+        'Reserva': ['S12345', 'S12346', 'S12347'],
+        'Pago': [1, 0, 1],
+        'Forma de Pago': ['TRANSF', 'WEBPAY', 'EFECT'],
+        'Monto Abono': [150000, 75000, 200000]
+    }
+    
+    df = pd.DataFrame(data)
+    
+    # Crear archivo Excel en memoria
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Pagos')
+    
+    return output.getvalue()
 
 def validate_excel_format(df):
     """
@@ -95,106 +99,104 @@ def validate_excel_format(df):
     for index, row in df.iterrows():
         row_errors = []
 
-        # 1. Validar formato de fecha
-        try:
-            if pd.isna(row['Fecha Pago']):
-                row_errors.append("Fecha de pago vacía")
-            elif not isinstance(row['Fecha Pago'], pd.Timestamp):
-                row_errors.append("Formato de fecha inválido")
-        except Exception:
-            row_errors.append("Error en columna Fecha Pago")
+        # Validar Fecha Pago
+        if pd.isna(row['Fecha Pago']):
+            row_errors.append("Fecha Pago vacía")
+        elif not isinstance(row['Fecha Pago'], (datetime, pd.Timestamp)):
+            row_errors.append("Fecha Pago no es una fecha válida")
 
-        # 2. Validar código de reserva (6 caracteres máximo)
-        try:
-            reserva = str(row['Reserva']).strip()
-            if pd.isna(row['Reserva']) or not reserva:
-                row_errors.append("Código de reserva vacío")
-            elif len(reserva) > 6:
-                row_errors.append(f"Código de reserva ({reserva}) excede 6 caracteres")
-        except Exception:
-            row_errors.append("Error en columna Reserva")
+        # Validar Reserva
+        if pd.isna(row['Reserva']):
+            row_errors.append("Reserva vacía")
+        else:
+            reserva_str = str(row['Reserva']).strip()
+            if len(reserva_str) == 0:
+                row_errors.append("Reserva vacía")
+            elif len(reserva_str) > 6:
+                row_errors.append("Reserva excede 6 caracteres")
 
-        # 3. Validar valor de pago (0 o 1)
-        try:
-            pago = row['Pago']
-            if pd.isna(pago):
-                row_errors.append("Valor de pago vacío")
-            elif pago not in [0, 1]:
-                row_errors.append(f"Valor de pago ({pago}) debe ser 0 o 1")
-        except Exception:
-            row_errors.append("Error en columna Pago")
+        # Validar Pago (debe ser 0 o 1)
+        if pd.isna(row['Pago']):
+            row_errors.append("Campo Pago vacío")
+        elif row['Pago'] not in [0, 1]:
+            row_errors.append("Campo Pago debe ser 0 (parcial) o 1 (total)")
 
-        # 4. Validar forma de pago (debe coincidir con los códigos del mapping)
-        try:
-            forma_pago = str(row['Forma de Pago']).strip()
-            if pd.isna(row['Forma de Pago']) or not forma_pago:
-                row_errors.append("Forma de pago vacía")
-            elif forma_pago not in valid_payment_methods:
-                row_errors.append(f"Forma de pago ({forma_pago}) no válida. Valores permitidos: {', '.join(valid_payment_methods)}")
-        except Exception:
-            row_errors.append("Error en columna Forma de Pago")
+        # Validar Monto Abono
+        if pd.isna(row['Monto Abono']):
+            row_errors.append("Monto Abono vacío")
+        else:
+            try:
+                monto = float(row['Monto Abono'])
+                if monto <= 0:
+                    row_errors.append("Monto Abono debe ser mayor a 0")
+            except (ValueError, TypeError):
+                row_errors.append("Monto Abono no es un número válido")
 
-        # 5. Validar Monto Abono
-        try:
-            monto = row['Monto Abono']
-            if pd.isna(monto):
-                row_errors.append("Monto de abono vacío")
-            elif not isinstance(monto, (int, float)) or monto <= 0:
-                row_errors.append(f"Monto de abono ({monto}) debe ser un número positivo")
-        except Exception:
-            row_errors.append("Error en columna Monto Abono")
+        # Validar Forma de Pago
+        if pd.isna(row['Forma de Pago']):
+            row_errors.append("Forma de Pago vacía")
+        else:
+            forma_pago = str(row['Forma de Pago']).strip().upper()
+            if forma_pago not in valid_payment_methods:
+                row_errors.append(f"Forma de Pago '{forma_pago}' no válida. Valores permitidos: {', '.join(sorted(valid_payment_methods))}")
 
-        # Si hay errores, el formato no es válido
+        # Si hay errores en esta fila, agregarlos al registro de errores
         if row_errors:
             is_valid = False
-
-            # Agregar los errores a la lista de registros con error
             for error in row_errors:
                 error_records.append({
-                    'Fila': index + 2,  # +2 para considerar el encabezado y base 1
-                    'Reserva': str(row.get('Reserva', '')),
+                    'Fila': index + 2,  # +2 porque Excel empieza en 1 y tiene header
+                    'Reserva': str(row.get('Reserva', 'N/A')),
                     'Error': error
                 })
 
     # Crear DataFrame con los errores
-    errors_df = pd.DataFrame(error_records)
+    if error_records:
+        errors_df = pd.DataFrame(error_records)
+    else:
+        errors_df = pd.DataFrame()
 
     return is_valid, errors_df
 
 def validate_orders_status(models, db, uid, password, df):
-    """
-    Valida el estado de las órdenes de venta antes de procesar pagos
-
-    Retorna:
-    - orders_status: DataFrame con el estado de cada orden
-    """
+    """Valida el estado de las órdenes en Odoo con lógica completa de conciliación"""
     orders_info = []
-    status_container = st.empty()
+    
+    # Crear barra de progreso
     progress_bar = st.progress(0)
-
+    status_container = st.empty()
+    
+    total_orders = len(df)
+    
+    # Crear columna limpia de reserva para comparaciones
+    df['Reserva_Clean'] = df['Reserva'].astype(str).str.strip()
+    
     for index, row in df.iterrows():
-        # Actualizar la barra de progreso
-        progress_bar.progress((index + 1) / len(df))
-
+        # Actualizar progreso
+        progress = (index + 1) / total_orders
+        progress_bar.progress(progress)
+        status_container.info(f"Validando orden {index + 1} de {total_orders}: {row['Reserva']}")
+        
         reserva = str(row['Reserva']).strip()
-        status_container.info(f"Validando orden {reserva} ({index + 1}/{len(df)})...")
-
-        # Obtener información del pago
-        es_pago_total = int(row.get('Pago', 0)) == 1
-        monto_abono = float(row.get('Monto Abono', 0))
-
-        # Buscar la orden en Odoo
+        monto_abono = float(row['Monto Abono'])
+        es_pago_total = row['Pago'] == 1
+        
+        # Buscar la orden de venta en Odoo
         domain = [('name', '=', reserva)]
         sale_order_ids = models.execute_kw(db, uid, password, 'sale.order', 'search', [domain])
-
+        
         if not sale_order_ids:
             # La orden no existe
             orders_info.append({
                 'Reserva': reserva,
+                'Reserva_Str': reserva,  # Para comparaciones
                 'Existe': False,
                 'Estado': 'N/A',
                 'Estado_Factura': 'N/A',
-                'Puede_Procesar': False,
+                'Monto_Total': 'N/A',
+                'Monto_Abono': f"${monto_abono:,.0f}",
+                'Es_Pago_Total': 'Sí' if es_pago_total else 'No',
+                'Procesable': False,
                 'Motivo': "Orden no encontrada en Odoo"
             })
         else:
@@ -237,13 +239,14 @@ def validate_orders_status(models, db, uid, password, df):
             
             orders_info.append({
                 'Reserva': reserva,
+                'Reserva_Str': reserva,  # Para comparaciones
                 'Existe': True,
                 'Estado': sale_order.get('state', 'N/A'),
                 'Estado_Factura': sale_order.get('invoice_status', 'N/A'),
                 'Monto_Total': monto_total_formato,  # Formato para visualización
                 'Monto_Abono': monto_abono_formato,  # Formato para visualización
                 'Es_Pago_Total': 'Sí' if es_pago_total else 'No',
-                'Puede_Procesar': can_process,
+                'Procesable': can_process,
                 'Motivo': motivo if not can_process else "OK"
             })
 
@@ -252,81 +255,19 @@ def validate_orders_status(models, db, uid, password, df):
 
     return pd.DataFrame(orders_info)
 
-def connect_to_odoo():
-    """Establece conexión con Odoo usando las credenciales de la sesión"""
-    # Crear indicador de estado para la conexión
-    status_container = st.empty()
-
-    # Verificar si hay credenciales almacenadas
-    if not all(k in st.session_state for k in ['odoo_url', 'odoo_db', 'odoo_username', 'odoo_password']):
-        status_container.error("❌ No hay credenciales de acceso. Por favor inicie sesión.")
-        return None, None, None, None
-
-    status_container.info("Intentando conectar con Odoo...")
-
-    try:
-        url = st.session_state['odoo_url']
-        db = st.session_state['odoo_db']
-        username = st.session_state['odoo_username']
-        password = st.session_state['odoo_password']
-
-        # Mostrar intentando conectar con servidor
-        status_container.info(f"Estableciendo conexión con {url}...")
-        # Crear conexión sin timeout (compatible con todas las versiones de Python)
-        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common', allow_none=True, use_datetime=True)
-
-        # Mostrar intentando autenticar
-        status_container.info("Autenticando...")
-        uid = common.authenticate(db, username, password, {})
-        if not uid:
-            status_container.error("❌ Error de autenticación. Verifique sus credenciales.")
-            # Limpiar credenciales incorrectas
-            for key in ['odoo_url', 'odoo_db', 'odoo_username', 'odoo_password']:
-                if key in st.session_state:
-                    del st.session_state[key]
-            return None, None, None, None
-
-        # Conexión exitosa, mostrar indicador de éxito
-        models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True, use_datetime=True)
-        status_container.success(f"✅ Conexión exitosa a Odoo ({url})")
-        return models, db, uid, password
-    except Exception as e:
-        status_container.error(f"❌ Error de conexión: {str(e)}")
-        # Limpiar credenciales en caso de error
-        for key in ['odoo_url', 'odoo_db', 'odoo_username', 'odoo_password']:
-            if key in st.session_state:
-                del st.session_state[key]
-        return None, None, None, None
-
-
-def format_date(date_value):
-    """Convierte la fecha al formato requerido dd-mm-aaaa"""
-    if isinstance(date_value, pd.Timestamp):
-        return date_value.strftime('%d-%m-%Y')
-    elif isinstance(date_value, str):
-        try:
-            date_obj = datetime.strptime(date_value, '%Y-%m-%d')
-            return date_obj.strftime('%d-%m-%Y')
-        except ValueError:
-            try:
-                date_obj = datetime.strptime(date_value, '%d-%m-%Y')
-                return date_value
-            except ValueError:
-                raise ValueError(f"Formato de fecha no reconocido: {date_value}")
-    else:
-        raise ValueError(f"Tipo de fecha no soportado: {type(date_value)}")
-
 def convert_to_odoo_date(date_value):
-    """Convierte la fecha a formato Odoo (YYYY-MM-DD)"""
-    if isinstance(date_value, pd.Timestamp):
+    """Convierte una fecha a formato Odoo (YYYY-MM-DD)"""
+    if isinstance(date_value, str):
+        # Intentar parsear diferentes formatos de fecha
+        for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y'):
+            try:
+                parsed_date = datetime.strptime(date_value, fmt)
+                return parsed_date.strftime('%Y-%m-%d')
+            except ValueError:
+                continue
+        raise ValueError(f"Formato de fecha no reconocido: {date_value}")
+    elif isinstance(date_value, (datetime, pd.Timestamp)):
         return date_value.strftime('%Y-%m-%d')
-    elif isinstance(date_value, str):
-        try:
-            date_obj = datetime.strptime(date_value, '%Y-%m-%d')
-            return date_value
-        except ValueError:
-            date_obj = datetime.strptime(date_value, '%d-%m-%Y')
-            return date_obj.strftime('%Y-%m-%d')
     else:
         raise ValueError(f"Tipo de fecha no soportado: {type(date_value)}")
 
@@ -364,6 +305,19 @@ def get_order_lines(models, db, uid, password, order_id):
         [[('order_id', '=', order_id)]], 
         {'fields': fields})
 
+def format_date(date_value):
+    """Formatea una fecha para mostrar en el memo"""
+    if isinstance(date_value, str):
+        try:
+            parsed_date = datetime.strptime(date_value, '%d/%m/%Y')
+            return parsed_date.strftime('%d/%m/%Y')
+        except ValueError:
+            return str(date_value)
+    elif isinstance(date_value, (datetime, pd.Timestamp)):
+        return date_value.strftime('%d/%m/%Y')
+    else:
+        return str(date_value)
+
 def register_payment_from_invoice(models, db, uid, password, invoice_id, payment_data, update_step):
     """Registra el pago usando el wizard nativo de Odoo"""
     try:
@@ -373,7 +327,7 @@ def register_payment_from_invoice(models, db, uid, password, invoice_id, payment
             invoice_check = models.execute_kw(db, uid, password, 'account.move', 'read', [[invoice_id]], {'fields': ['name', 'state']})
             update_step(f"Factura encontrada: {invoice_check[0]['name']} (Estado: {invoice_check[0]['state']})")
         except Exception as e:
-            update_step(f"\u26a0\ufe0f No se pudo verificar la factura: {str(e)}")
+            update_step(f"⚠️ No se pudo verificar la factura: {str(e)}")
             
         context = {
             'active_model': 'account.move',
@@ -394,7 +348,6 @@ def register_payment_from_invoice(models, db, uid, password, invoice_id, payment
         update_step(f"Creando wizard de pago con valores: {wizard_vals}")
         
         # Agregar manejo de tiempo para detectar operaciones lentas
-        import time
         start_time = time.time()
         
         try:
@@ -405,11 +358,11 @@ def register_payment_from_invoice(models, db, uid, password, invoice_id, payment
             elapsed = time.time() - start_time
             update_step(f"Wizard creado en {elapsed:.2f} segundos, ID: {payment_register}")
         except Exception as e:
-            update_step(f"\u274c Error al crear el wizard de pago: {str(e)}")
+            update_step(f"❌ Error al crear el wizard de pago: {str(e)}")
             return False
 
         if not payment_register:
-            update_step("\u274c Error al crear el wizard de pago: No se obtuvo ID")
+            update_step("❌ Error al crear el wizard de pago: No se obtuvo ID")
             return False
 
         update_step("Ejecutando pago...")
@@ -423,36 +376,56 @@ def register_payment_from_invoice(models, db, uid, password, invoice_id, payment
             elapsed = time.time() - start_time
             update_step(f"Pago ejecutado en {elapsed:.2f} segundos, Resultado: {result}")
         except Exception as e:
-            update_step(f"\u274c Error al ejecutar el pago: {str(e)}")
+            update_step(f"❌ Error al ejecutar el pago: {str(e)}")
             return False
 
         if not result:
-            update_step("\u26a0\ufe0f Advertencia: El pago se ejecutó pero no retornó resultado")
+            update_step("⚠️ Advertencia: El pago se ejecutó pero no retornó resultado")
             
-        update_step("\u2705 Pago registrado exitosamente")
-        return True
+        update_step("✅ Pago registrado exitosamente")
+        
+        # Intentar obtener el ID del pago creado desde el resultado
+        payment_id = None
+        if result and isinstance(result, dict):
+            if 'res_id' in result:
+                payment_id = result['res_id']
+            elif 'domain' in result:
+                # Buscar en el dominio si hay información del pago
+                domain = result.get('domain', [])
+                for condition in domain:
+                    if isinstance(condition, list) and len(condition) == 3 and condition[0] == 'id':
+                        if condition[1] == '=' and isinstance(condition[2], int):
+                            payment_id = condition[2]
+                        elif condition[1] == 'in' and isinstance(condition[2], list) and condition[2]:
+                            payment_id = condition[2][0]
+        
+        # Si no pudimos obtener el ID del resultado, buscar el pago más reciente para esta factura
+        if not payment_id:
+            try:
+                # Buscar pagos relacionados con esta factura
+                payment_domain = [
+                    ('reconciled_invoice_ids', 'in', [invoice_id]),
+                    ('state', 'in', ['posted', 'sent', 'reconciled'])
+                ]
+                payment_ids = models.execute_kw(db, uid, password, 'account.payment', 'search', 
+                                              [payment_domain], {'order': 'create_date desc', 'limit': 1})
+                if payment_ids:
+                    payment_id = payment_ids[0]
+                    update_step(f"ID del pago encontrado: {payment_id}")
+            except Exception as e:
+                update_step(f"⚠️ No se pudo obtener ID del pago: {str(e)}")
+        
+        return payment_id if payment_id else True
 
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        update_step(f"\u274c Error al registrar pago: {str(e)}")
+        update_step(f"❌ Error al registrar pago: {str(e)}")
         update_step(f"Detalles del error: {error_trace}")
         return False
 
 def process_record(models, db, uid, password, row, orders_status_df, progress_bar, progress_step, update_step):
-    """Procesa un registro del Excel con actualización de pasos
-
-    Args:
-        update_step: Función para actualizar el paso actual en el log
-        
-    Nota:
-        Si row['Pago'] = 1: Se valida que el monto del abono coincida con el total de la orden
-        Si row['Pago'] = 0: Se permite un pago parcial (monto del abono puede ser menor al total)
-        
-    Caso especial:
-        Si row['Pago'] = 0 y la orden ya está facturada (invoice_status='invoiced'):
-        Se busca la factura existente y se asocia el pago a ella sin crear una nueva factura
-    """
+    """Procesa un registro del Excel con actualización de pasos completa"""
     # Inicializar el avance
     current_step = 0
     progress_bar.progress(current_step * progress_step)
@@ -461,12 +434,11 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
     reserva = str(row['Reserva']).strip()
     reserva_clean = str(row['Reserva_Clean']).strip() if 'Reserva_Clean' in row else reserva
     
-    # Obtener la fila correspondiente en el DataFrame de validación (solo para información)
+    # Obtener la fila correspondiente en el DataFrame de validación
     order_status_rows = orders_status_df[orders_status_df['Reserva_Str'].astype(str).str.strip() == reserva_clean]
     if len(order_status_rows) > 0:
         order_status = order_status_rows.iloc[0]
     else:
-        # Esto no debería ocurrir nunca con la nueva implementación
         order_status = {'Estado': 'Desconocido', 'Estado_Factura': 'Desconocido'}
 
     # Buscar la orden de venta
@@ -518,9 +490,8 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
     total_orden = float(sale_order['amount_total'])
     
     # Validar monto si es pago total (Pago=1)
-    if not es_pago_parcial and abs(monto - total_orden) > 0.01:  # Tolerancia de 0.01 para errores de redondeo
+    if not es_pago_parcial and abs(monto - total_orden) > 0.01:
         update_step(f"⚠️ Advertencia: Pago marcado como total pero el monto ({monto}) no coincide con el total de la orden ({total_orden})")
-        # Continuamos de todas formas, pero dejamos la advertencia en el log
 
     # Verificar si es un caso especial: pago parcial para orden ya facturada
     es_caso_especial = es_pago_parcial and sale_order.get('invoice_status') == 'invoiced'
@@ -531,7 +502,6 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
     if es_caso_especial:
         # Manejar caso especial: buscar factura existente para pago parcial en orden ya facturada
         update_step("🔍 Buscando factura existente para la orden...")
-        # Buscar facturas relacionadas con la orden
         domain = [
             ('invoice_origin', '=', reserva),
             ('move_type', '=', 'out_invoice'),
@@ -558,7 +528,6 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
                                       [invoice_id], {'fields': ['name', 'amount_total', 'amount_residual']})[0]
         
         update_step(f"✅ Factura existente encontrada: {invoice_data['name']}")
-        update_step(f"Total factura: ${invoice_data['amount_total']}, Pendiente: ${invoice_data['amount_residual']}")
         
         # Preparar memo para el pago
         memo = f"{reserva} / {payment_method}/{formatted_date} (PAGO PARCIAL ADICIONAL)"
@@ -578,7 +547,6 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
         }
     else:
         # Caso normal: crear factura y registrar pago
-        # Preparar datos para el memo
         if es_pago_parcial:
             memo = f"{reserva} / {payment_method}/{formatted_date} (PAGO PARCIAL)"
             update_step(f"💰 Procesando pago PARCIAL por ${monto} de un total de ${total_orden}")
@@ -597,7 +565,7 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
                 'product_uom_id': line['product_uom'][0],
                 'price_unit': line['price_unit'],
                 'tax_ids': [(6, 0, line['tax_id'])],
-                'sale_line_ids': [(6, 0, [line['id']])]  # Vinculación directa con la línea de venta
+                'sale_line_ids': [(6, 0, [line['id']])]
             }
             invoice_lines.append((0, 0, invoice_line))
 
@@ -613,7 +581,7 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
             'date': invoice_date,
             'journal_id': 1,  # Diario de ventas
             'invoice_origin': reserva,
-            'ref': reserva,  # Referencia a la orden
+            'ref': reserva,
             'invoice_line_ids': invoice_lines
         }
 
@@ -634,39 +602,14 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
         current_step += 1
         progress_bar.progress(current_step * progress_step)
 
-        # Publicar factura
-        update_step("📣 Publicando factura...")
+        # Confirmar factura
+        update_step("✅ Confirmando factura...")
         models.execute_kw(db, uid, password, 'account.move', 'action_post', [[invoice_id]])
-        update_step(f"✅ Factura creada y publicada con ID: {invoice_id}")
 
         current_step += 1
         progress_bar.progress(current_step * progress_step)
 
-        # Actualizar la orden de venta
-        update_step("🔄 Actualizando orden de venta...")
-        try:
-            # Actualizar el estado de facturación de la orden
-            models.execute_kw(db, uid, password, 'sale.order', 'write', [
-                [sale_order_ids[0]], 
-                {'invoice_status': 'invoiced'}
-            ])
-
-            # Establecer relación directa entre orden y factura
-            try:
-                models.execute_kw(db, uid, password, 'sale.order', 'write', [
-                    [sale_order_ids[0]], 
-                    {'invoice_ids': [(4, invoice_id, 0)]}
-                ])
-                update_step("✅ Orden de venta vinculada con factura")
-            except Exception as e:
-                update_step(f"⚠️ No se pudo establecer relación orden-factura: {str(e)}")
-        except Exception as e:
-            update_step(f"⚠️ Error al actualizar la orden de venta: {str(e)}")
-
-        # Registrar el pago para la factura (sea existente o recién creada)
-        current_step += 1
-        progress_bar.progress(current_step * progress_step)
-
+        # Preparar datos del pago
         payment_data = {
             'amount': monto,
             'date': invoice_date,
@@ -674,82 +617,481 @@ def process_record(models, db, uid, password, row, orders_status_df, progress_ba
             'memo': memo
         }
 
-    # Registrar el pago para la factura (sea existente o recién creada)
-    update_step("💰 Registrando pago...")
+    # Registrar el pago
+    update_step("💳 Registrando pago...")
+    payment_success = register_payment_from_invoice(models, db, uid, password, invoice_id, payment_data, update_step)
 
     current_step += 1
     progress_bar.progress(current_step * progress_step)
 
-    if register_payment_from_invoice(models, db, uid, password, invoice_id, payment_data, update_step):
-        current_step += 1
-        progress_bar.progress(1.0)  # Completar la barra
-        update_step("✅ Proceso completado exitosamente")
-        # Determinar estado del pago
-        estado_pago = 'Parcial' if es_pago_parcial else 'Total'
-        
+    if payment_success:
+        update_step("🎉 Registro completado exitosamente")
         return {
             'Reserva': reserva,
             'Status': 'Éxito',
-            'Mensaje': f'Proceso completado exitosamente (Pago {estado_pago})',
+            'Mensaje': 'Procesado correctamente',
             'Estado_Orden': order_status['Estado'],
-            'Estado_Factura': 'invoiced',  # Ahora está facturado
-            'Factura': str(invoice_id),
-            'Pago': estado_pago,
-            'Conciliación': 'Si'
+            'Estado_Factura': order_status['Estado_Factura'],
+            'Factura': 'Sí',
+            'Pago': 'Sí',
+            'Conciliación': 'Sí',
+            'order_id': sale_order_ids[0] if sale_order_ids else None,
+            'invoice_id': invoice_id,
+            'payment_id': payment_success if isinstance(payment_success, int) else None
         }
     else:
-        current_step += 1
-        progress_bar.progress(current_step * progress_step)
-        update_step("⚠️ Factura creada, error al registrar pago")
+        update_step("❌ Error en el registro del pago")
         return {
             'Reserva': reserva,
-            'Status': 'Parcial',
-            'Mensaje': 'Factura creada, error al registrar pago',
+            'Status': 'Error',
+            'Mensaje': 'Error al registrar pago',
             'Estado_Orden': order_status['Estado'],
-            'Estado_Factura': 'invoiced',  # Parcialmente facturado
-            'Factura': str(invoice_id),
+            'Estado_Factura': order_status['Estado_Factura'],
+            'Factura': 'Sí' if not es_caso_especial else 'Existente',
             'Pago': 'No',
-            'Conciliación': 'No'
+            'Conciliación': 'No',
+            'order_id': sale_order_ids[0] if sale_order_ids else None,
+            'invoice_id': invoice_id,
+            'payment_id': None
         }
 
-def generate_excel_template():
-    """Genera un template de Excel con datos de ejemplo"""
-    # Crear un DataFrame con las columnas requeridas y un registro de ejemplo
-    df = pd.DataFrame([
-        {
-            'Fecha Pago': '01/09/2025',
-            'Reserva': 'S12345',
-            'Pago': 1,  # 1 = Pago total, 0 = Pago parcial
-            'Forma de Pago': 'TRANSF',
-            'Monto Abono': 150000
-        },
-        {
-            'Fecha Pago': '02/09/2025',
-            'Reserva': 'S12346',
-            'Pago': 0,  # Ejemplo de pago parcial
-            'Forma de Pago': 'DEP',
-            'Monto Abono': 75000
-        }
-    ])
-    
-    # Crear un archivo temporal
-    temp_file = 'template_pagos_temp.xlsx'
-    
-    # Guardar el DataFrame como Excel
-    df.to_excel(temp_file, index=False)
-    
-    # Leer el archivo como bytes
-    with open(temp_file, 'rb') as f:
-        data = f.read()
-    
-    # Eliminar el archivo temporal
-    if os.path.exists(temp_file):
-        os.remove(temp_file)
-    
-    return data
+class ProcessingStage:
+    ORDER_FOUND = "order_found"
+    INVOICE_CREATED = "invoice_created" 
+    INVOICE_CONFIRMED = "invoice_confirmed"
+    PAYMENT_REGISTERED = "payment_registered"
+    PAYMENT_RECONCILED = "payment_reconciled"
 
-def main():
-    st.title("Importación de Pagos a Odoo")
+class RecordProcessor:
+    def __init__(self):
+        self.audit_log = []
+        
+    def create_audit_entry(self, reserva):
+        """Crea una entrada de auditoría para un registro"""
+        audit_entry = {
+            'reserva': reserva,
+            'stages': {
+                'order_found': {'status': 'pending', 'data': None, 'error': None},
+                'invoice_created': {'status': 'pending', 'data': None, 'error': None},
+                'invoice_confirmed': {'status': 'pending', 'data': None, 'error': None},
+                'payment_registered': {'status': 'pending', 'data': None, 'error': None},
+                'payment_reconciled': {'status': 'pending', 'data': None, 'error': None}
+            },
+            'final_status': 'processing',
+            'timestamp': datetime.now(),
+            'error_summary': None
+        }
+        self.audit_log.append(audit_entry)
+        return audit_entry
+    
+    def get_stage_icon(self, stage_data):
+        """Retorna icono según el estado de la etapa"""
+        if stage_data['status'] == 'success':
+            return '✅'
+        elif stage_data['status'] == 'failed':
+            return '❌'
+        elif stage_data['status'] == 'warning':
+            return '⚠️'
+        elif stage_data['status'] == 'skipped':
+            return '⏭️'
+        elif stage_data['status'] == 'processing':
+            return '🔄'
+        else:
+            return '⏳'
+    
+    def get_final_status_icon(self, final_status):
+        """Retorna icono según el estado final"""
+        if final_status == 'completed':
+            return '🎉'
+        elif final_status == 'failed':
+            return '💥'
+        elif final_status == 'partial':
+            return '⚠️'
+        else:
+            return '🔄'
+    
+    def render_progress_table(self, placeholder):
+        """Renderiza tabla de progreso en tiempo real"""
+        if not self.audit_log:
+            return
+            
+        progress_data = []
+        for entry in self.audit_log:
+            row = {
+                'Reserva': entry['reserva'],
+                '🔍 Orden': self.get_stage_icon(entry['stages']['order_found']),
+                '📄 Factura': self.get_stage_icon(entry['stages']['invoice_created']),
+                '✅ Confirmada': self.get_stage_icon(entry['stages']['invoice_confirmed']),
+                '💳 Pago': self.get_stage_icon(entry['stages']['payment_registered']),
+                '🔗 Conciliada': self.get_stage_icon(entry['stages']['payment_reconciled']),
+                'Estado': self.get_final_status_icon(entry['final_status']),
+                'Error': entry['error_summary'] or ''
+            }
+            progress_data.append(row)
+        
+        df_progress = pd.DataFrame(progress_data)
+        with placeholder.container():
+            st.subheader("📊 Progreso del Procesamiento")
+            st.dataframe(df_progress, use_container_width=True)
+
+def validate_stage_in_odoo(models, db, uid, password, stage, data):
+    """Valida que una etapa realmente se completó en Odoo"""
+    try:
+        if stage == 'order_found' and data:
+            # Verificar que la orden existe
+            result = models.execute_kw(db, uid, password, 'sale.order', 'read', 
+                                     [[data]], {'fields': ['id', 'name']})
+            return len(result) > 0
+            
+        elif stage == 'invoice_created' and data:
+            # Verificar que la factura existe y está en estado correcto
+            result = models.execute_kw(db, uid, password, 'account.move', 'read',
+                                     [[data]], {'fields': ['id', 'name', 'state']})
+            return len(result) > 0 and result[0]['state'] in ['draft', 'posted']
+            
+        elif stage == 'invoice_confirmed' and data:
+            # Verificar que la factura está confirmada (posted)
+            result = models.execute_kw(db, uid, password, 'account.move', 'read',
+                                     [[data]], {'fields': ['state']})
+            return len(result) > 0 and result[0]['state'] == 'posted'
+            
+        elif stage == 'payment_registered' and data:
+            # Verificar que el pago existe
+            result = models.execute_kw(db, uid, password, 'account.payment', 'read',
+                                     [[data]], {'fields': ['id', 'name', 'state']})
+            return len(result) > 0 and result[0]['state'] in ['draft', 'posted']
+            
+        elif stage == 'payment_reconciled' and data:
+            # Verificar que el pago está reconciliado
+            result = models.execute_kw(db, uid, password, 'account.payment', 'read',
+                                     [[data]], {'fields': ['state', 'is_reconciled']})
+            return len(result) > 0 and result[0].get('is_reconciled', False)
+            
+        return False
+    except Exception:
+        return False
+
+def process_payments(models, db, uid, password, df, orders_status_df, progress_container, details_container):
+    """Procesa los pagos en Odoo con sistema de auditoría robusto y validación granular"""
+    # Inicializar procesador con auditoría
+    processor = RecordProcessor()
+    
+    # Ya no necesitamos filtrar - df viene 100% validado
+    total_records = len(df)
+    
+    if total_records == 0:
+        st.warning("⚠️ No hay registros para procesar.")
+        return {
+            'total_processed': 0,
+            'facturas_creadas': 0,
+            'pagos_registrados': 0,
+            'conciliaciones_exitosas': 0,
+            'ordenes_omitidas': 0,
+            'success_rate': 0,
+            'results_df': pd.DataFrame(),
+            'log_file': "No hay registros para procesar"
+        }
+    
+    # Crear placeholders para progreso
+    progress_placeholder = st.empty()
+    general_progress_placeholder = st.empty()
+    current_order_placeholder = st.empty()
+    
+    progress_step = 1.0 / (total_records * 8)  # 8 pasos por registro
+    
+    # Contadores
+    facturas_creadas = 0
+    pagos_registrados = 0
+    conciliaciones_exitosas = 0
+    
+    for idx, row in df.iterrows():
+        reserva = str(row['Reserva']).strip()
+        
+        # Crear entrada de auditoría
+        audit_entry = processor.create_audit_entry(reserva)
+        
+        # Mostrar progreso general
+        general_progress = (idx + 1) / total_records
+        with general_progress_placeholder.container():
+            st.subheader(f"📊 Progreso General: {idx + 1}/{total_records} registros procesados")
+            st.progress(general_progress)
+        
+        # Mostrar orden actual
+        with current_order_placeholder.container():
+            st.info(f"🔄 Procesando orden {idx + 1} de {total_records}: **{reserva}**")
+            current_phase = st.empty()
+        
+        # Crear barra de progreso individual
+        progress_bar = st.progress(0)
+        
+        try:
+            progress_container.info(f"Procesando {idx + 1}/{total_records}: {reserva}")
+            
+            # Procesar el registro usando la función existente pero con auditoría
+            def update_step(message):
+                details_container.write(f"**{reserva}:** {message}")
+                # Actualizar fase actual
+                current_phase.write(f"📍 **Fase actual:** {message}")
+            
+            # Usar la función existente process_record pero capturar errores por etapa
+            try:
+                result = process_record(models, db, uid, password, row, orders_status_df, 
+                                      progress_bar, progress_step, update_step)
+                
+                # Validación granular mejorada con verificación real en Odoo
+                if result['Status'] == 'Éxito':
+                    # Extraer IDs de los datos del resultado si están disponibles
+                    order_id = result.get('order_id')
+                    invoice_id = result.get('invoice_id')
+                    payment_id = result.get('payment_id')
+                    
+                    # Validar cada etapa individualmente en Odoo
+                    stages_validation = {
+                        'order_found': validate_stage_in_odoo(models, db, uid, password, 'order_found', order_id),
+                        'invoice_created': validate_stage_in_odoo(models, db, uid, password, 'invoice_created', invoice_id),
+                        'invoice_confirmed': validate_stage_in_odoo(models, db, uid, password, 'invoice_confirmed', invoice_id),
+                        'payment_registered': validate_stage_in_odoo(models, db, uid, password, 'payment_registered', payment_id),
+                        'payment_reconciled': validate_stage_in_odoo(models, db, uid, password, 'payment_reconciled', payment_id)
+                    }
+                    
+                    # Actualizar estados basado en validación real
+                    all_stages_valid = True
+                    for stage, is_valid in stages_validation.items():
+                        if is_valid:
+                            audit_entry['stages'][stage]['status'] = 'success'
+                            audit_entry['stages'][stage]['data'] = locals().get(f"{stage.split('_')[0]}_id")
+                        else:
+                            audit_entry['stages'][stage]['status'] = 'warning'
+                            audit_entry['stages'][stage]['error'] = 'No se pudo verificar en Odoo'
+                            all_stages_valid = False
+                    
+                    # Estado final basado en validación granular
+                    if all_stages_valid:
+                        audit_entry['final_status'] = 'completed'
+                    else:
+                        audit_entry['final_status'] = 'partial'
+                        audit_entry['error_summary'] = 'Algunas etapas no pudieron ser verificadas en Odoo'
+                else:
+                    # Marcar como fallido
+                    audit_entry['final_status'] = 'failed'
+                    audit_entry['error_summary'] = result['Mensaje']
+                    
+            except Exception as process_error:
+                audit_entry['final_status'] = 'failed'
+                audit_entry['error_summary'] = str(process_error)
+                raise process_error
+            
+            # Actualizar contadores según auditoría
+            if audit_entry['final_status'] == 'completed':
+                if audit_entry['stages']['invoice_created']['status'] == 'success':
+                    facturas_creadas += 1
+                if audit_entry['stages']['payment_registered']['status'] == 'success':
+                    pagos_registrados += 1
+                if audit_entry['stages']['payment_reconciled']['status'] == 'success':
+                    conciliaciones_exitosas += 1
+            
+            # Actualizar tabla de progreso en tiempo real
+            processor.render_progress_table(progress_placeholder)
+            
+            progress_bar.empty()
+            current_phase.empty()
+            
+        except Exception as e:
+            # Error crítico - marcar como fallido y continuar
+            audit_entry['final_status'] = 'failed'
+            audit_entry['error_summary'] = f"Error crítico: {str(e)}"
+            details_container.error(f"**{reserva}:** ❌ Error crítico: {str(e)}")
+            
+            # Actualizar tabla de progreso
+            processor.render_progress_table(progress_placeholder)
+            
+            progress_bar.empty()
+            current_phase.empty()
+            continue  # Continuar con el siguiente registro
+    
+    # Generar resultados finales desde auditoría
+    results = []
+    for entry in processor.audit_log:
+        result = {
+            'Reserva': entry['reserva'],
+            'Status': 'Éxito' if entry['final_status'] == 'completed' else 'Error',
+            'Mensaje': entry['error_summary'] or 'Procesado correctamente',
+            'Estado_Orden': 'Procesado',
+            'Estado_Factura': 'Procesado',
+            'Factura': 'Sí' if entry['stages']['invoice_created']['status'] == 'success' else 'No',
+            'Pago': 'Sí' if entry['stages']['payment_registered']['status'] == 'success' else 'No',
+            'Conciliación': 'Sí' if entry['stages']['payment_reconciled']['status'] == 'success' else 'No'
+        }
+        results.append(result)
+    
+    # Calcular estadísticas finales
+    completed_count = len([e for e in processor.audit_log if e['final_status'] == 'completed'])
+    success_rate = (completed_count / total_records * 100) if total_records > 0 else 0
+    
+    # Crear log completo desde auditoría
+    log_entries = []
+    for entry in processor.audit_log:
+        log_entries.append(f"[{entry['reserva']}] Estado final: {entry['final_status']}")
+        if entry['error_summary']:
+            log_entries.append(f"[{entry['reserva']}] Error: {entry['error_summary']}")
+    log_file = "\n".join(log_entries)
+    
+    # Limpiar placeholders de progreso
+    general_progress_placeholder.empty()
+    current_order_placeholder.empty()
+    
+    progress_container.success(f"✅ Procesamiento completado: {completed_count}/{total_records} registros exitosos")
+    
+    # Crear tabla de resumen para descarga
+    summary_data = []
+    for entry in processor.audit_log:
+        summary_row = {
+            'Reserva': entry['reserva'],
+            'Estado_Final': 'Completado' if entry['final_status'] == 'completed' else 'Fallido',
+            'Orden_Encontrada': '✅' if entry['stages']['order_found']['status'] == 'success' else '❌',
+            'Factura_Creada': '✅' if entry['stages']['invoice_created']['status'] == 'success' else '❌',
+            'Factura_Confirmada': '✅' if entry['stages']['invoice_confirmed']['status'] == 'success' else '❌',
+            'Pago_Registrado': '✅' if entry['stages']['payment_registered']['status'] == 'success' else '❌',
+            'Pago_Conciliado': '✅' if entry['stages']['payment_reconciled']['status'] == 'success' else '❌',
+            'Error': entry['error_summary'] or 'Sin errores',
+            'Timestamp': entry['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+        }
+        summary_data.append(summary_row)
+    
+    summary_df = pd.DataFrame(summary_data)
+    
+    # Crear archivo Excel de resumen
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        summary_df.to_excel(writer, index=False, sheet_name='Resumen_Procesamiento')
+    
+    # Mostrar botón de descarga
+    st.download_button(
+        label="📥 Descargar Resumen de Procesamiento",
+        data=output.getvalue(),
+        file_name=f"resumen_procesamiento_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Descarga un resumen detallado del procesamiento realizado"
+    )
+    
+    # Botón para re-auditar manualmente después del procesamiento
+    if st.button("🔍 Re-auditar Registros", help="Vuelve a verificar el estado real de todos los registros en Odoo"):
+        st.info("🔄 Iniciando re-auditoría manual...")
+        
+        # Re-auditar cada registro
+        for entry in processor.audit_log:
+            reserva = entry['reserva']
+            
+            # Buscar IDs reales en Odoo para esta reserva
+            try:
+                # Buscar orden
+                order_domain = [('name', '=', reserva)]
+                order_ids = models.execute_kw(db, uid, password, 'sale.order', 'search', [order_domain])
+                order_id = order_ids[0] if order_ids else None
+                
+                # Buscar factura relacionada
+                invoice_id = None
+                if order_id:
+                    invoice_domain = [('invoice_origin', '=', reserva)]
+                    invoice_ids = models.execute_kw(db, uid, password, 'account.move', 'search', [invoice_domain])
+                    invoice_id = invoice_ids[0] if invoice_ids else None
+                
+                # Buscar pago relacionado
+                payment_id = None
+                if invoice_id:
+                    payment_domain = [('reconciled_invoice_ids', 'in', [invoice_id])]
+                    payment_ids = models.execute_kw(db, uid, password, 'account.payment', 'search', [payment_domain])
+                    payment_id = payment_ids[0] if payment_ids else None
+                
+                # Re-validar cada etapa con los IDs encontrados
+                stages_validation = {
+                    'order_found': validate_stage_in_odoo(models, db, uid, password, 'order_found', order_id),
+                    'invoice_created': validate_stage_in_odoo(models, db, uid, password, 'invoice_created', invoice_id),
+                    'invoice_confirmed': validate_stage_in_odoo(models, db, uid, password, 'invoice_confirmed', invoice_id),
+                    'payment_registered': validate_stage_in_odoo(models, db, uid, password, 'payment_registered', payment_id),
+                    'payment_reconciled': validate_stage_in_odoo(models, db, uid, password, 'payment_reconciled', payment_id)
+                }
+                
+                # Actualizar estados basado en re-validación
+                all_stages_valid = True
+                for stage, is_valid in stages_validation.items():
+                    if is_valid:
+                        entry['stages'][stage]['status'] = 'success'
+                        entry['stages'][stage]['data'] = locals().get(f"{stage.split('_')[0]}_id")
+                    else:
+                        entry['stages'][stage]['status'] = 'failed'
+                        entry['stages'][stage]['error'] = 'No encontrado en Odoo durante re-auditoría'
+                        all_stages_valid = False
+                
+                # Actualizar estado final
+                if all_stages_valid:
+                    entry['final_status'] = 'completed'
+                    entry['error_summary'] = None
+                else:
+                    entry['final_status'] = 'failed'
+                    entry['error_summary'] = 'Algunas etapas no se encontraron en Odoo'
+                    
+            except Exception as e:
+                entry['final_status'] = 'failed'
+                entry['error_summary'] = f'Error durante re-auditoría: {str(e)}'
+        
+        # Actualizar tabla de progreso con nuevos resultados
+        processor.render_progress_table(progress_placeholder)
+        
+        # Mostrar estadísticas actualizadas
+        completed_count = len([e for e in processor.audit_log if e['final_status'] == 'completed'])
+        success_rate = (completed_count / total_records * 100) if total_records > 0 else 0
+        
+        st.success(f"✅ Re-auditoría completada: {completed_count}/{total_records} registros verificados como exitosos ({success_rate:.1f}%)")
+        
+        # Generar nuevo resumen con datos actualizados
+        updated_summary_data = []
+        for entry in processor.audit_log:
+            summary_row = {
+                'Reserva': entry['reserva'],
+                'Estado_Final': 'Completado' if entry['final_status'] == 'completed' else 'Fallido',
+                'Orden_Encontrada': '✅' if entry['stages']['order_found']['status'] == 'success' else '❌',
+                'Factura_Creada': '✅' if entry['stages']['invoice_created']['status'] == 'success' else '❌',
+                'Factura_Confirmada': '✅' if entry['stages']['invoice_confirmed']['status'] == 'success' else '❌',
+                'Pago_Registrado': '✅' if entry['stages']['payment_registered']['status'] == 'success' else '❌',
+                'Pago_Conciliado': '✅' if entry['stages']['payment_reconciled']['status'] == 'success' else '❌',
+                'Error': entry['error_summary'] or 'Sin errores',
+                'Timestamp_Reauditoria': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            updated_summary_data.append(summary_row)
+        
+        updated_summary_df = pd.DataFrame(updated_summary_data)
+        
+        # Crear nuevo archivo Excel con datos actualizados
+        updated_output = io.BytesIO()
+        with pd.ExcelWriter(updated_output, engine='openpyxl') as writer:
+            updated_summary_df.to_excel(writer, index=False, sheet_name='Resumen_Reauditoria')
+        
+        # Botón de descarga actualizado
+        st.download_button(
+            label="📥 Descargar Resumen Re-auditado",
+            data=updated_output.getvalue(),
+            file_name=f"resumen_reauditado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Descarga el resumen actualizado después de la re-auditoría manual"
+        )
+    
+    return {
+        'total_processed': total_records,
+        'facturas_creadas': facturas_creadas,
+        'pagos_registrados': pagos_registrados,
+        'conciliaciones_exitosas': conciliaciones_exitosas,
+        'ordenes_omitidas': 0,  # Ya no hay filtrado
+        'success_rate': round(success_rate, 1),
+        'results_df': pd.DataFrame(results),
+        'log_file': log_file,
+        'audit_log': processor.audit_log,  # Incluir auditoría completa
+        'summary_df': summary_df  # Incluir resumen para descarga
+    }
+
+def render_import_pagos_page():
+    """Renderiza la página de importación de pagos (página principal)"""
+    st.title("🏠 Importación de Pagos a Odoo")
     
     # Crear una sección para el template
     st.sidebar.markdown("---")
@@ -773,26 +1115,15 @@ def main():
         help="Descarga un archivo Excel con el formato correcto y ejemplos para importar pagos"
     )
     
-    # Mostrar formulario de login y obtener credenciales
+    # Obtener credenciales desde session_state (ahora manejadas en el sidebar)
     url, db, username, password = show_login_form()
 
     # Verificar si el usuario está logueado
     is_logged_in = all([url, db, username, password])
 
     if not is_logged_in:
-        st.warning("Por favor inicie sesión para acceder a la herramienta.")
+        st.warning("Por favor inicie sesión usando el formulario en la barra lateral.")
         return
-
-    # Mostrar nombre de usuario en la barra lateral
-    st.sidebar.success(f"✅ Conectado como: {username}")
-
-    # Botón para cerrar sesión
-    if st.sidebar.button("Cerrar Sesión"):
-        # Eliminar todas las credenciales y el estado de login
-        for key in ['odoo_url', 'odoo_db', 'odoo_username', 'odoo_password', 'is_logged_in', 'processing_complete']:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.experimental_rerun()
     
     st.write("Esta herramienta permite importar pagos a Odoo desde un archivo Excel.")
     
@@ -814,91 +1145,203 @@ def main():
     # Procesar el archivo subido o mostrar los resultados anteriores
     if st.session_state['processing_complete']:
         # Mostrar los resultados guardados en la sesión
-        if 'processing_results' in st.session_state and 'results_df' in st.session_state:
+        if 'processing_results' in st.session_state:
             results = st.session_state['processing_results']
-            results_df = st.session_state['results_df']
+            results_df = results['results_df']
             
             # Mostrar el mensaje de éxito
             st.success(f"✅ Procesamiento completado: {results['total_processed']} registros")
             
-            # Botón de descarga del log
-            st.download_button(
-                label="Descargar Log Completo",
-                data=st.session_state['log_file'].encode('utf-8'),
-                file_name="log_procesamiento.txt",
-                mime="text/plain",
-                key="persistent_download_log"
-            )
+            # Mostrar estadísticas de procesamiento
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Procesados", results['total_processed'])
+            with col2:
+                st.metric("Facturas Creadas", results['facturas_creadas'])
+            with col3:
+                st.metric("Pagos Registrados", results['pagos_registrados'])
+            with col4:
+                st.metric("Tasa de Éxito", f"{results['success_rate']}%")
             
-            # Mostrar resultados
-            st.write("### Resultados del Procesamiento:")
-            
-            # Función para colorear las filas según el resultado
-            def highlight_status(row):
-                if row['Status'] == 'Éxito':
-                    # Diferenciar entre pagos totales y parciales
-                    if row['Pago'] == 'Parcial':
-                        return ['background-color: #E6FFCC'] * len(row)  # Verde más claro para pagos parciales
-                    else:
-                        return ['background-color: #CCFFCC'] * len(row)  # Verde estándar para pagos totales
-                elif row['Status'] == 'Parcial':
-                    return ['background-color: #FFFFCC'] * len(row)  # Amarillo para éxito parcial (factura sin pago)
-                elif row['Status'] == 'Omitido':
-                    return ['background-color: #EFEFEF'] * len(row)  # Gris para omitidos
-                else:
-                    return ['background-color: #FFCCCC'] * len(row)  # Rojo para errores
-            
-            # Mostrar el dataframe con los resultados
-            if isinstance(results_df, pd.DataFrame) and not results_df.empty:
-                st.dataframe(results_df.style.apply(highlight_status, axis=1))
-            
-                # Mostrar resumen
-                st.write("Resumen:")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total procesados", results['total_processed'])
-                with col2:
-                    st.metric("Facturas creadas", results['facturas_creadas'])
-                with col3:
-                    st.metric("Pagos registrados", results['pagos_registrados'])
+            # Mostrar tabla de resumen detallado si existe
+            if 'summary_df' in results and not results['summary_df'].empty:
+                st.subheader("📊 Resumen Detallado del Procesamiento")
                 
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Conciliaciones exitosas", results['conciliaciones_exitosas'])
-                with col2:
-                    st.metric("Órdenes omitidas", results['ordenes_omitidas'])
-                with col3:
-                    st.metric("Tasa de éxito", f"{results['success_rate']}%")
+                # Aplicar estilo para mejor visualización
+                def highlight_status(row):
+                    if row['Estado_Final'] == 'Completado':
+                        return ['background-color: #e8f5e8; color: #2e7d32'] * len(row)
+                    else:
+                        return ['background-color: #ffebee; color: #c62828'] * len(row)
+                
+                styled_summary = results['summary_df'].style.apply(highlight_status, axis=1)
+                st.dataframe(styled_summary, use_container_width=True)
+                
+                # Botón de descarga del resumen detallado
+                summary_output = io.BytesIO()
+                with pd.ExcelWriter(summary_output, engine='openpyxl') as writer:
+                    results['summary_df'].to_excel(writer, index=False, sheet_name='Resumen_Procesamiento')
+                
+                st.download_button(
+                    label="📥 Descargar Resumen Detallado",
+                    data=summary_output.getvalue(),
+                    file_name=f"resumen_procesamiento_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="Descarga el resumen completo con todas las etapas del procesamiento"
+                )
+                
+                # Botón para re-auditar manualmente después del procesamiento
+                if st.button("🔍 Re-auditar Registros", help="Vuelve a verificar el estado real de todos los registros en Odoo"):
+                    # Conectar a Odoo para re-auditar
+                    models, db_name, uid, odoo_password = connect_to_odoo()
+                    if not all([models, db_name, uid, odoo_password]):
+                        st.error("❌ No se pudo conectar a Odoo para re-auditar")
+                        return
+                    
+                    st.info("🔄 Iniciando re-auditoría manual...")
+                    
+                    # Obtener audit_log desde los resultados
+                    if 'audit_log' in results:
+                        audit_log = results['audit_log']
+                        total_records = len(audit_log)
+                        
+                        # Re-auditar cada registro
+                        for entry in audit_log:
+                            reserva = entry['reserva']
+                            
+                            # Buscar IDs reales en Odoo para esta reserva
+                            try:
+                                # Buscar orden
+                                order_domain = [('name', '=', reserva)]
+                                order_ids = models.execute_kw(db_name, uid, odoo_password, 'sale.order', 'search', [order_domain])
+                                order_id = order_ids[0] if order_ids else None
+                                
+                                # Buscar factura relacionada
+                                invoice_id = None
+                                if order_id:
+                                    invoice_domain = [('invoice_origin', '=', reserva)]
+                                    invoice_ids = models.execute_kw(db_name, uid, odoo_password, 'account.move', 'search', [invoice_domain])
+                                    invoice_id = invoice_ids[0] if invoice_ids else None
+                                
+                                # Buscar pago relacionado
+                                payment_id = None
+                                if invoice_id:
+                                    payment_domain = [('reconciled_invoice_ids', 'in', [invoice_id])]
+                                    payment_ids = models.execute_kw(db_name, uid, odoo_password, 'account.payment', 'search', [payment_domain])
+                                    payment_id = payment_ids[0] if payment_ids else None
+                                
+                                # Re-validar cada etapa con los IDs encontrados
+                                stages_validation = {
+                                    'order_found': validate_stage_in_odoo(models, db_name, uid, odoo_password, 'order_found', order_id),
+                                    'invoice_created': validate_stage_in_odoo(models, db_name, uid, odoo_password, 'invoice_created', invoice_id),
+                                    'invoice_confirmed': validate_stage_in_odoo(models, db_name, uid, odoo_password, 'invoice_confirmed', invoice_id),
+                                    'payment_registered': validate_stage_in_odoo(models, db_name, uid, odoo_password, 'payment_registered', payment_id),
+                                    'payment_reconciled': validate_stage_in_odoo(models, db_name, uid, odoo_password, 'payment_reconciled', payment_id)
+                                }
+                                
+                                # Actualizar estados basado en re-validación
+                                all_stages_valid = True
+                                for stage, is_valid in stages_validation.items():
+                                    if is_valid:
+                                        entry['stages'][stage]['status'] = 'success'
+                                        entry['stages'][stage]['data'] = locals().get(f"{stage.split('_')[0]}_id")
+                                    else:
+                                        entry['stages'][stage]['status'] = 'failed'
+                                        entry['stages'][stage]['error'] = 'No encontrado en Odoo durante re-auditoría'
+                                        all_stages_valid = False
+                                
+                                # Actualizar estado final
+                                if all_stages_valid:
+                                    entry['final_status'] = 'completed'
+                                    entry['error_summary'] = None
+                                else:
+                                    entry['final_status'] = 'failed'
+                                    entry['error_summary'] = 'Algunas etapas no se encontraron en Odoo'
+                                    
+                            except Exception as e:
+                                entry['final_status'] = 'failed'
+                                entry['error_summary'] = f'Error durante re-auditoría: {str(e)}'
+                        
+                        # Mostrar estadísticas actualizadas
+                        completed_count = len([e for e in audit_log if e['final_status'] == 'completed'])
+                        success_rate = (completed_count / total_records * 100) if total_records > 0 else 0
+                        
+                        st.success(f"✅ Re-auditoría completada: {completed_count}/{total_records} registros verificados como exitosos ({success_rate:.1f}%)")
+                        
+                        # Generar nuevo resumen con datos actualizados
+                        updated_summary_data = []
+                        for entry in audit_log:
+                            summary_row = {
+                                'Reserva': entry['reserva'],
+                                'Estado_Final': 'Completado' if entry['final_status'] == 'completed' else 'Fallido',
+                                'Orden_Encontrada': '✅' if entry['stages']['order_found']['status'] == 'success' else '❌',
+                                'Factura_Creada': '✅' if entry['stages']['invoice_created']['status'] == 'success' else '❌',
+                                'Factura_Confirmada': '✅' if entry['stages']['invoice_confirmed']['status'] == 'success' else '❌',
+                                'Pago_Registrado': '✅' if entry['stages']['payment_registered']['status'] == 'success' else '❌',
+                                'Pago_Conciliado': '✅' if entry['stages']['payment_reconciled']['status'] == 'success' else '❌',
+                                'Error': entry['error_summary'] or 'Sin errores',
+                                'Timestamp_Reauditoria': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            }
+                            updated_summary_data.append(summary_row)
+                        
+                        updated_summary_df = pd.DataFrame(updated_summary_data)
+                        
+                        # Mostrar tabla actualizada
+                        st.subheader("📊 Resumen Re-auditado")
+                        def highlight_updated_status(row):
+                            if row['Estado_Final'] == 'Completado':
+                                return ['background-color: #e8f5e8; color: #2e7d32'] * len(row)
+                            else:
+                                return ['background-color: #ffebee; color: #c62828'] * len(row)
+                        
+                        styled_updated = updated_summary_df.style.apply(highlight_updated_status, axis=1)
+                        st.dataframe(styled_updated, use_container_width=True)
+                        
+                        # Crear nuevo archivo Excel con datos actualizados
+                        updated_output = io.BytesIO()
+                        with pd.ExcelWriter(updated_output, engine='openpyxl') as writer:
+                            updated_summary_df.to_excel(writer, index=False, sheet_name='Resumen_Reauditoria')
+                        
+                        # Botón de descarga actualizado
+                        st.download_button(
+                            label="📥 Descargar Resumen Re-auditado",
+                            data=updated_output.getvalue(),
+                            file_name=f"resumen_reauditado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            help="Descarga el resumen actualizado después de la re-auditoría manual"
+                        )
+                        
+                        # Actualizar los resultados en session_state con los datos re-auditados
+                        results['audit_log'] = audit_log
+                        results['summary_df'] = updated_summary_df
+                        st.session_state['processing_results'] = results
+                        
+                    else:
+                        st.warning("⚠️ No se encontró información de auditoría para re-auditar")
+            else:
+                # Mostrar tabla básica si no hay resumen detallado
+                st.subheader("Resultados del Procesamiento")
+                st.dataframe(results_df)
             
-            # Descargar resultados
-            st.download_button(
-                label="Descargar Resultados",
-                data=results_df.to_csv(index=False).encode('utf-8'),
-                file_name="resultados_importacion.csv",
-                mime="text/csv",
-                key="persistent_download_results"
-            )
-            
-            # Botón para iniciar una nueva carga de datos
-            st.write("")
-            st.write("")
-            if st.button("Iniciar una nueva carga de datos", key="persistent_new_upload"):
+            # Botón para procesar un nuevo archivo
+            if st.button("Procesar Nuevo Archivo"):
                 # Reiniciar el estado pero mantener las credenciales de sesión
                 for key in ['orders_status_df', 'validation_complete', 'show_process_button', 
-                          'processing_complete', 'processing_results', 'log_file', 'results_df']:
+                          'processing_complete', 'processing_results']:
                     if key in st.session_state:
                         del st.session_state[key]
                 st.experimental_rerun()
+
     elif uploaded_file is not None:
         try:
-            # Cargar el Excel pero sin procesar las fechas aún
+            # Cargar el Excel
             df = pd.read_excel(uploaded_file)
 
             # Mostrar vista previa de los datos
             st.write("Vista previa de los datos:")
             st.dataframe(df.head())
 
-            # Validar las columnas requeridas primero
+            # Validar las columnas requeridas
             required_columns = ['Fecha Pago', 'Reserva', 'Pago', 'Monto Abono', 'Forma de Pago']
             missing_columns = [col for col in required_columns if col not in df.columns]
 
@@ -906,7 +1349,7 @@ def main():
                 st.error(f"El archivo no contiene todas las columnas requeridas. Faltan: {', '.join(missing_columns)}")
                 return
 
-            # Convertir la columna de fecha una vez que sabemos que existe
+            # Convertir la columna de fecha
             df['Fecha Pago'] = pd.to_datetime(df['Fecha Pago'], errors='coerce')
 
             # Validar el formato completo del Excel
@@ -914,549 +1357,140 @@ def main():
 
             if not is_valid_format:
                 st.error("⚠️ El archivo Excel contiene errores de formato que deben corregirse antes de procesar.")
-
-                # Mostrar los errores en una tabla con colores
                 st.write("Errores encontrados:")
-                st.dataframe(errors_df.style.apply(lambda _: ['background-color: #FFCCCC'] * len(errors_df.columns), axis=1))
-
-                # Opción para descargar los errores
-                st.download_button(
-                    label="Descargar Errores",
-                    data=errors_df.to_csv(index=False).encode('utf-8'),
-                    file_name="errores_formato.csv",
-                    mime="text/csv"
-                )
+                st.dataframe(errors_df)
                 return
 
-            # Si el formato es válido, mostrar mensaje de éxito y habilitar botón para validar órdenes
+            # Si el formato es válido
             st.success("✅ Formato del archivo Excel validado correctamente.")
 
             # Crear un botón para validar el estado de las órdenes
             if st.button("Validar Estado de Órdenes"):
+                # Verificar conexión antes de proceder
+                if not st.session_state.get('connection_verified', False):
+                    st.error("❌ Primero debe probar y verificar la conexión a Odoo usando el botón '🔌 Probar Conexión a Odoo' en la barra lateral.")
+                    return
+                
                 # Conectar a Odoo para validar órdenes
-                models, db, uid, password = connect_to_odoo()
-                if not all([models, db, uid, password]):
-                    status_container.error("❌ No se pudo conectar a Odoo")
+                models, db_name, uid, odoo_password = connect_to_odoo()
+                if not all([models, db_name, uid, odoo_password]):
+                    st.error("❌ No se pudo conectar a Odoo")
                     return
 
                 # Validar el estado de las órdenes
                 status_container.info("Validando estado de las órdenes...")
-                orders_status_df = validate_orders_status(models, db, uid, password, df)
+                orders_status_df = validate_orders_status(models, db_name, uid, odoo_password, df)
+                
+                # Guardar el resultado en session_state
+                st.session_state['orders_status_df'] = orders_status_df
+                st.session_state['validation_complete'] = True
+                
+                # Determinar si se debe mostrar el botón de procesar
+                processable_count = len(orders_status_df[orders_status_df['Procesable'] == True])
+                total_count = len(orders_status_df)
+                
+                st.session_state['show_process_button'] = (processable_count == total_count and processable_count > 0)
+                st.experimental_rerun()
 
-                # Mostrar los resultados de la validación
-                st.write("Estado de las órdenes:")
-
-                # Aplicar colores según el estado
-                def highlight_rows(row):
-                    if not row['Existe']:
-                        return ['background-color: #FFCCCC'] * len(row)
-                    elif not row['Puede_Procesar']:
-                        return ['background-color: #FFFFCC'] * len(row)
-                    else:
-                        return ['background-color: #CCFFCC'] * len(row)
-
-                st.dataframe(orders_status_df.style.apply(highlight_rows, axis=1))
-
-                # Calcular estadísticas
-                total_orders = len(orders_status_df)
-                valid_orders = len(orders_status_df[orders_status_df['Puede_Procesar']])
-                invalid_orders = total_orders - valid_orders
-
-                # Mostrar resumen
-                st.write("Resumen de validación:")
+            # Mostrar resultados de validación si existen
+            if st.session_state.get('validation_complete', False) and 'orders_status_df' in st.session_state:
+                orders_status_df = st.session_state['orders_status_df']
+                
+                # Mostrar estadísticas
+                processable_count = len(orders_status_df[orders_status_df['Procesable'] == True])
+                total_count = len(orders_status_df)
+                
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("Total de órdenes", total_orders)
+                    st.metric("Total de registros", total_count)
                 with col2:
-                    st.metric("Órdenes válidas", valid_orders)
+                    st.metric("Registros procesables", processable_count)
                 with col3:
-                    st.metric("Órdenes no procesables", invalid_orders)
+                    success_rate = (processable_count / total_count * 100) if total_count > 0 else 0
+                    st.metric("Tasa de éxito", f"{success_rate:.1f}%")
 
-                # Opción para descargar los resultados de la validación
-                st.download_button(
-                    label="Descargar Resultados de Validación",
-                    data=orders_status_df.to_csv(index=False).encode('utf-8'),
-                    file_name="validacion_ordenes.csv",
-                    mime="text/csv"
-                )
+                # Mostrar tabla de resultados
+                st.write("### Estado de las Órdenes:")
+                
+                # Aplicar estilo condicional para marcar filas no procesables en rojo
+                def highlight_non_processable(row):
+                    if not row['Procesable']:
+                        return ['background-color: #ffebee; color: #c62828'] * len(row)
+                    else:
+                        return [''] * len(row)
+                
+                # Mostrar tabla con estilo
+                styled_df = orders_status_df.style.apply(highlight_non_processable, axis=1)
+                st.dataframe(styled_df, use_container_width=True)
 
-                # Solo mostrar el botón de procesar cuando TODAS las órdenes sean válidas (100%)
-                if valid_orders > 0 and valid_orders == total_orders and invalid_orders == 0:
-                    st.session_state['orders_status_df'] = orders_status_df
-                    st.session_state['validation_complete'] = True
-                    st.success(f"✅ Todas las {total_orders} órdenes están listas para procesar.")
-                    st.info("💡 **Recomendación**: Puede limpiar la base de datos antes de procesar si lo desea.")
-                    st.session_state['show_process_button'] = True  # Mostrar botón solo cuando 100% están aptos
-                elif valid_orders > 0:
-                    st.session_state['orders_status_df'] = orders_status_df
-                    st.session_state['validation_complete'] = True
-                    st.warning(f"⚠️ Solo {valid_orders} de {total_orders} órdenes están listas para procesar. Corrija los {invalid_orders} registros con problemas antes de continuar.")
-                    st.session_state['show_process_button'] = False  # Ocultar botón cuando hay registros mixtos
-                else:
-                    st.warning("⚠️ No hay órdenes válidas para procesar. Corrija los problemas identificados e intente nuevamente.")
-                    st.session_state['show_process_button'] = False
-
-            # Botón para procesar pagos (solo se muestra si la validación está completa)
-            if st.session_state.get('show_process_button', False):
-                if st.button("Procesar Pagos"):
-                    # Recuperar datos validados
-                    orders_status_df = st.session_state['orders_status_df']
-
-                    # Conectar a Odoo si es necesario
-                    if 'models' not in locals():
-                        models, db, uid, password = connect_to_odoo()
-                        if not all([models, db, uid, password]):
-                            status_container.error("❌ No se pudo conectar a Odoo")
+                # Mostrar el botón de procesar solo si todos los registros son procesables
+                if st.session_state.get('show_process_button', False):
+                    st.success("✅ Todos los registros están listos para procesar")
+                    
+                    if st.button("🚀 Procesar Pagos", type="primary"):
+                        # Verificar conexión antes de procesar
+                        if not st.session_state.get('connection_verified', False):
+                            st.error("❌ Primero debe probar y verificar la conexión a Odoo usando el botón '🔌 Probar Conexión a Odoo' en la barra lateral.")
                             return
-
-                    # Crear contenedores para el seguimiento del progreso
-                    st.write("### Progreso del Procesamiento")
-                    col1, col2 = st.columns([2, 1])
-
-                    with col1:
-                        st.write("#### Progreso General:")
-                        overall_progress = st.progress(0)
-                        overall_status = st.empty()
-
-                    with col2:
-                        st.write("#### Estadísticas:")
-                        processed_counter = st.empty()
-                        success_counter = st.empty()
-                        error_counter = st.empty()
-
-                    # Crear contenedor para el log de actividad
-                    st.write("#### Log de Actividad:")
-                    log_container = st.container()
-                    with log_container:
-                        log_placeholder = st.empty()
-
-                    # Crear contenedor para el registro actual
-                    st.write("#### Registro Actual:")
-                    current_record_container = st.container()
-                    with current_record_container:
-                        current_record_info = st.empty()
-                        record_progress = st.progress(0)
-                        current_step_info = st.empty()
-
-                    
-                    # Preparar variables para el procesamiento
-                    results = []
-                    log_entries = []
-                    processed = 0
-                    successful = 0
-                    errors = 0
-                    
-                    # Número de pasos en el proceso
-                    total_steps = 10
-                    progress_step = 1.0 / total_steps
-                    
-                    # Validar el formato del archivo
-                    validation_errors = validate_excel_format(df)
-                    if validation_errors and isinstance(validation_errors, list) and validation_errors:
-                        st.error("\n".join([str(error) for error in validation_errors]))
-                        return
-                    
-                    # Conectar a Odoo
-                    models, db, uid, password = connect_to_odoo()
-                    if not models:
-                        st.error("No se pudo conectar a Odoo. Verifique sus credenciales.")
-                        return
                         
-                    # Preparar DataFrame para el estado de las órdenes
-                    # Esto reemplaza la función check_orders_status que no está implementada
-                    orders_data = []
-                    for _, row in df.iterrows():
-                        reserva = "Desconocido"
-                        try:
-                            reserva = str(row['Reserva']).strip()
-                            # Buscar la orden en Odoo
-                            domain = [('name', '=', reserva)]
-                            sale_order_ids = models.execute_kw(db, uid, password, 'sale.order', 'search', [domain])
-                            
-                            if not sale_order_ids:
-                                orders_data.append({
-                                    'Reserva': reserva,
-                                    'Puede_Procesar': False,
-                                    'Motivo': 'Orden no encontrada en Odoo',
-                                    'Estado': 'No encontrado',
-                                    'Estado_Factura': 'N/A'
-                                })
-                                continue
-                                
-                            # Obtener detalles de la orden
-                            # Usamos try-except para manejar posibles errores de tipo
-                            try:
-                                order_id = sale_order_ids[0] if isinstance(sale_order_ids, list) and len(sale_order_ids) > 0 else 0
-                                sale_order = models.execute_kw(db, uid, password, 'sale.order', 'read',
-                                    [order_id], {'fields': ['state', 'invoice_status']})
-                            except (TypeError, IndexError) as e:
-                                st.error(f"Error al obtener detalles de la orden {reserva}: {str(e)}")
-                                sale_order = []
-                            
-                            if not sale_order or not isinstance(sale_order, list) or len(sale_order) == 0:
-                                orders_data.append({
-                                    'Reserva': reserva,
-                                    'Puede_Procesar': False,
-                                    'Motivo': 'No se pudieron obtener detalles de la orden',
-                                    'Estado': 'Error',
-                                    'Estado_Factura': 'N/A'
-                                })
-                                continue
-                                
-                            sale_order_data = sale_order[0]
-                            
-                            # Verificar si la orden puede ser procesada
-                            puede_procesar = True  # Por defecto, asumimos que es procesable
-                            motivo = ''
-                            
-                            state = sale_order_data.get('state', '')
-                            invoice_status = sale_order_data.get('invoice_status', '')
-                            
-                            # Verificar estado de la orden
-                            if state not in ['sale', 'done']:
-                                puede_procesar = False
-                                motivo = f"Estado de orden inválido: {state}"
-                            
-                            # Verificar si hay un monto de abono válido
-                            try:
-                                # Asegurar que el valor existe y es convertible a float
-                                if 'Monto Abono' in row and row['Monto Abono'] is not None:
-                                    monto_abono = float(row['Monto Abono'])
-                                    if monto_abono <= 0:
-                                        puede_procesar = False
-                                        motivo = "Monto de abono inválido o cero"
-                                else:
-                                    puede_procesar = False
-                                    motivo = "No se encontró monto de abono"
-                            except (ValueError, TypeError):
-                                puede_procesar = False
-                                motivo = "Monto de abono no es un número válido"
-                                
-                            # Verificar si la orden ya está pagada completamente
-                            if invoice_status == 'invoiced':
-                                # Verificar si es pago total
-                                es_pago_total = False
-                                if isinstance(row, dict) and 'Pago' in row:
-                                    try:
-                                        if int(row['Pago']) == 1:
-                                            es_pago_total = True
-                                    except (ValueError, TypeError):
-                                        pass
-                                
-                                if es_pago_total:
-                                    # Obtener facturas de la orden
-                                    try:
-                                        invoice_ids = models.execute_kw(db, uid, password, 'account.move', 'search',
-                                                                    [[('invoice_origin', '=', reserva), ('move_type', '=', 'out_invoice')]])
-                                        if invoice_ids:
-                                            invoice_data = models.execute_kw(db, uid, password, 'account.move', 'read',
-                                                                        [invoice_ids[0]], {'fields': ['payment_state']})
-                                            if invoice_data and isinstance(invoice_data, list) and len(invoice_data) > 0:
-                                                invoice_info = invoice_data[0]
-                                                if isinstance(invoice_info, dict) and 'payment_state' in invoice_info:
-                                                    if invoice_info['payment_state'] == 'paid':
-                                                        puede_procesar = False
-                                                        motivo = "La orden ya está completamente pagada"
-                                    except Exception as e:
-                                        # Si hay error al verificar, permitimos procesar pero lo registramos
-                                        st.warning(f"Advertencia al verificar pagos de {reserva}: {str(e)}")
-                            
-                                
-                            orders_data.append({
-                                'Reserva': reserva,
-                                'Puede_Procesar': puede_procesar,
-                                'Motivo': motivo,
-                                'Estado': state,
-                                'Estado_Factura': invoice_status
-                            })
-                        except Exception as e:
-                            st.error(f"Error al verificar estado de orden {reserva}: {str(e)}")
-                            orders_data.append({
-                                'Reserva': reserva,
-                                'Puede_Procesar': False,
-                                'Motivo': f"Error: {str(e)}",
-                                'Estado': 'Error',
-                                'Estado_Factura': 'Error'
-                            })
-                    
-                    # Crear DataFrame con los estados de las órdenes
-                    orders_status_df = pd.DataFrame(orders_data)
-
-                    # Filtrar solo las órdenes que pueden ser procesadas
-                    # Asegurar que todas las reservas están en formato string limpio para comparación
-                    orders_status_df['Reserva_Str'] = orders_status_df['Reserva'].astype(str).str.strip()
-                    
-                    # Verificar explícitamente que Puede_Procesar sea True (no solo truthy)
-                    # Esto evita problemas con valores que podrían evaluarse como True pero no son exactamente True
-                    procesable_df = orders_status_df[orders_status_df['Puede_Procesar'].apply(lambda x: x is True)]
-                    procesable_orders = procesable_df['Reserva_Str'].tolist()
-                    
-                    # Log de depuración - Órdenes procesables (eliminado - ya no necesario)
-                    # Solo procesar órdenes validadas
-                    
-                    # Filtrar el DataFrame original para incluir solo órdenes procesables
-                    # Convertir las reservas a string y eliminar espacios para comparación exacta
-                    df['Reserva_Clean'] = df['Reserva'].astype(str).str.strip()
-                    df_procesable = df[df['Reserva_Clean'].isin(procesable_orders)].copy()
-                    
-                    # Guardar el DataFrame de validación en la sesión para usarlo en el paso de procesamiento
-                    st.session_state['orders_status_df'] = orders_status_df
-                    
-                    # Guardar el DataFrame filtrado en la sesión
-                    st.session_state['df_procesable'] = df_procesable
-                    
-                    # Calcular estadísticas
-                    total_registros = len(df)
-                    registros_procesables = len(df_procesable)
-                    registros_filtrados = total_registros - registros_procesables
-                    
-                    if registros_procesables == 0:
-                        st.error("\u274c No hay registros procesables. Por favor, revise los datos y vuelva a intentarlo.")
-                        return
-                    
-                    # NUEVO: Impedir procesar si hay registros no procesables
-                    if registros_filtrados > 0:
-                        st.error(f"⛔ No se puede continuar. Hay {registros_filtrados} registros que no son procesables.")
-                        st.warning("Para continuar, todos los registros deben ser procesables. Por favor, corrija los errores o elimine los registros con problemas del archivo Excel.")
+                        # Conectar a Odoo para procesar pagos
+                        models, db_name, uid, odoo_password = connect_to_odoo()
+                        if not all([models, db_name, uid, odoo_password]):
+                            st.error("❌ No se pudo conectar a Odoo para procesar pagos")
+                            return
                         
-                        # Mostrar qué registros fueron filtrados con sus motivos
-                        registros_no_procesables = df[~df['Reserva_Clean'].isin(procesable_orders)]
-                        st.write("### Registros no procesables:")
+                        # Filtrar solo los registros procesables
+                        processable_df = df[df['Reserva'].isin(orders_status_df[orders_status_df['Procesable']]['Reserva'])]
                         
-                        # Unir con el DataFrame de validación para mostrar los motivos
-                        registros_no_procesables['Reserva_Str'] = registros_no_procesables['Reserva_Clean']
-                        merged_df = pd.merge(
-                            registros_no_procesables[['Reserva', 'Reserva_Str', 'Monto Abono']], 
-                            orders_status_df[['Reserva_Str', 'Motivo']], 
-                            on='Reserva_Str',
-                            how='left'
-                        )
+                        if len(processable_df) == 0:
+                            st.error("No hay registros procesables para procesar.")
+                            return
                         
-                        st.dataframe(merged_df[['Reserva', 'Monto Abono', 'Motivo']])
-                        return
-                    
-                    # NO modificar el DataFrame orders_status_df original, ya que contiene la información completa de validación
-                    # En su lugar, usar el DataFrame filtrado procesable_df para el procesamiento
-                    
-                    # Confirmar que solo se procesarán los registros correctos
-                    st.success(f"Se procesarán únicamente {registros_procesables} registros válidos.")
-                    
-                    # Reiniciar contadores y variables para el procesamiento
-                    results = []
-                    log_entries = []
-                    processed = 0
-                    successful = 0
-                    errors = 0
-                    
-                    for index, row in df_procesable.iterrows():
-                        # Actualizar progreso general
-                        try:
-                            # Convertir explícitamente a tipos numéricos para evitar errores de tipo
-                            df_len = len(df_procesable) if hasattr(df_procesable, '__len__') else 0
-                            if df_len > 0:
-                                # Asegurar que index sea un número
-                                idx_num = index if isinstance(index, (int, float)) else 0
-                                progress_percent = float(idx_num) / float(df_len)
-                                # Calcular el índice para mostrar (1-based)
-                                idx_display = int(idx_num) + 1 if isinstance(idx_num, (int, float)) else 1
-                                # Calcular el porcentaje para mostrar
-                                percent_display = int(progress_percent * 100)
-                            else:
-                                progress_percent = 0.0
-                                idx_display = 1
-                                percent_display = 0
-                            overall_progress.progress(progress_percent)
-                            overall_status.info(f"Procesando registro {idx_display} de {df_len} ({percent_display}%)")
-
-                        except Exception as e:
-                            st.warning(f"Error al actualizar progreso: {str(e)}")
-                            overall_progress.progress(0)
-                            overall_status.info("Procesando registros...")
-
+                        # Procesar los pagos
+                        progress_container.info(f"Procesando {len(processable_df)} registros...")
                         
-                        # Formatear la fecha
-                        fecha_pago = None
-                        try:
-                            # Verificar si el valor existe y no es NaN
-                            if 'Fecha Pago' in row and pd.notna(row['Fecha Pago']):
-                                # Intentar formatear la fecha
-                                if hasattr(row['Fecha Pago'], 'strftime'):
-                                    fecha_pago = row['Fecha Pago'].strftime('%Y-%m-%d')
-                                else:
-                                    fecha_pago = str(row['Fecha Pago'])
-                        except Exception as e:
-                            st.warning(f"Error al formatear fecha: {str(e)}")
-                            fecha_pago = "Fecha no válida"
+                        results = process_payments(models, db_name, uid, odoo_password, processable_df, 
+                                                 orders_status_df, progress_container, details_container)
                         
-                        # Mostrar información del registro actual
-                        try:
-                            reserva = str(row.get('Reserva', 'N/A')) if hasattr(row, 'get') else str(row['Reserva'] if 'Reserva' in row else 'N/A')
-                            forma_pago = str(row.get('Forma de Pago', 'N/A')) if hasattr(row, 'get') else str(row['Forma de Pago'] if 'Forma de Pago' in row else 'N/A')
-                            monto = str(row.get('Monto Abono', 0)) if hasattr(row, 'get') else str(row['Monto Abono'] if 'Monto Abono' in row else 0)
-                            current_record_info.info(f"Procesando: Reserva {reserva} - {fecha_pago} - {forma_pago} - ${monto}")
-                        except Exception as e:
-                            st.warning(f"Error al mostrar información del registro: {str(e)}")
-                            current_record_info.info("Procesando registro...")
-                        
-                        
-                        # Resetear progreso del registro
-                        record_progress.progress(0)
-                        current_step_info.info("Iniciando procesamiento...")
-
-                        # Definir una función para actualizar el paso actual
-                        def update_step_info(message):
-                            current_step_info.info(message)
-                            # Añadir al log
-                            timestamp = datetime.now().strftime("%H:%M:%S")
-                            log_entries.append(f"[{timestamp}] [{row['Reserva']}] {message}")
-                            # Mostrar log actualizado (últimas 10 entradas)
-                            log_placeholder.code("\n".join(log_entries[-10:]))
-
-                        # Log de depuración antes de procesar
-                        update_step_info(f"Procesando registro con reserva: {row['Reserva']} (Reserva_Clean: {row['Reserva_Clean']})")
-                        
-                        # Procesar registro con función de actualización
-                        result = process_record(models, db, uid, password, row, orders_status_df, 
-                                             record_progress, progress_step, update_step_info)
-                        
-                        # Log del resultado
-                        update_step_info(f"Resultado del procesamiento: {result['Status']} - {result['Mensaje']}")
-                        results.append(result)
-
-                        # Actualizar contadores
-                        processed += 1
-                        if result['Status'] == 'Éxito':
-                            successful += 1
-                        elif result['Status'] == 'Error':
-                            errors += 1
-
-                        # Actualizar estadísticas
-                        processed_counter.metric("Procesados", f"{processed}/{len(df_procesable)}")
-                        success_counter.metric("Exitosos", successful)
-                        error_counter.metric("Errores", errors)
-
-                        # Pequeña pausa para visualizar
-                        time.sleep(0.5)
-
-                    # Completar progreso general
-                    overall_progress.progress(1.0)
-                    overall_status.success(f"✅ Procesamiento completado: {len(df_procesable)} registros procesables de {len(df)} totales")
-                    
-                    # Guardar log completo y resultados en la sesión
-                    log_file = "\n".join(log_entries)
-                    st.session_state['log_file'] = log_file
-                    
-                    # Crear DataFrame con los resultados
-                    results_df = pd.DataFrame(results)
-                    
-                    # Guardar en session_state antes de calcular métricas para evitar errores de lint
-                    st.session_state['results_df'] = results_df
-                    
-                    # Calcular las métricas
-                    if isinstance(results_df, pd.DataFrame) and not results_df.empty:
-                        total_processed = len(results_df)
-                        facturas_creadas = len(results_df[results_df['Factura'] != 'No'])
-                        pagos_registrados = len(results_df[results_df['Pago'] == 'Registrado'])
-                        conciliaciones_exitosas = len(results_df[results_df['Conciliación'] == 'Si'])
-                        ordenes_omitidas = len(results_df[results_df['Status'] == 'Omitido'])
-                        processed_orders = len(results_df[results_df['Status'] != 'Omitido'])
-                        success_rate = round(len(results_df[results_df['Status'] == 'Éxito']) / max(processed_orders, 1) * 100, 2)
-                        
-                        # Guardar todos los datos necesarios para mantener la vista de resultados
-                        st.session_state['processing_results'] = {
-                            'log_file': log_file,
-                            'total_processed': total_processed,
-                            'facturas_creadas': facturas_creadas,
-                            'pagos_registrados': pagos_registrados,
-                            'conciliaciones_exitosas': conciliaciones_exitosas,
-                            'ordenes_omitidas': ordenes_omitidas,
-                            'success_rate': success_rate
-                        }
-                        
-                        # Marcar que el procesamiento está completo
+                        # Guardar resultados en session_state
+                        st.session_state['processing_results'] = results
                         st.session_state['processing_complete'] = True
-                    
-                    # Botón de descarga que usa los datos guardados en la sesión
-                    st.download_button(
-                        label="Descargar Log Completo",
-                        data=log_file.encode('utf-8'),
-                        file_name="log_procesamiento.txt",
-                        mime="text/plain",
-                        key="download_log"
-                    )
-
-                    # Mostrar resultados
-                    st.write("### Resultados del Procesamiento:")
-                    results_df = pd.DataFrame(results)
-                    column_order = ['Reserva', 'Status', 'Estado_Orden', 'Estado_Factura', 'Factura', 'Pago', 'Conciliación', 'Mensaje']
-                    results_df = results_df[column_order]
-
-                    # Función para colorear las filas según el resultado
-                    def highlight_status(row):
-                        if row['Status'] == 'Éxito':
-                            # Diferenciar entre pagos totales y parciales
-                            if row['Pago'] == 'Parcial':
-                                return ['background-color: #E6FFCC'] * len(row)  # Verde más claro para pagos parciales
-                            else:
-                                return ['background-color: #CCFFCC'] * len(row)  # Verde estándar para pagos totales
-                        elif row['Status'] == 'Parcial':
-                            return ['background-color: #FFFFCC'] * len(row)  # Amarillo para éxito parcial (factura sin pago)
-                        elif row['Status'] == 'Omitido':
-                            return ['background-color: #EFEFEF'] * len(row)  # Gris para omitidos
-                        else:
-                            return ['background-color: #FFCCCC'] * len(row)  # Rojo para errores
-
-                    st.dataframe(results_df.style.apply(highlight_status, axis=1))
-
-                    # Mostrar resumen
-                    st.write("Resumen:")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Total procesados", len(results_df))
-                    with col2:
-                        st.metric("Facturas creadas", len(results_df[results_df['Factura'] != 'No']))
-                    with col3:
-                        st.metric("Pagos registrados", len(results_df[results_df['Pago'] == 'Registrado']))
-
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Conciliaciones exitosas", len(results_df[results_df['Conciliación'] == 'Si']))
-                    with col2:
-                        st.metric("Órdenes omitidas", len(results_df[results_df['Status'] == 'Omitido']))
-                    with col3:
-                        processed_orders = len(results_df[results_df['Status'] != 'Omitido'])
-                        if processed_orders > 0:
-                            success_rate = round(len(results_df[results_df['Status'] == 'Éxito']) / processed_orders * 100, 2)
-                        else:
-                            success_rate = 0
-                        st.metric("Tasa de éxito", f"{success_rate}%")
-
-                    # Descargar resultados
-                    st.download_button(
-                        label="Descargar Resultados",
-                        data=results_df.to_csv(index=False).encode('utf-8'),
-                        file_name="resultados_importacion.csv",
-                        mime="text/csv",
-                        key="download_results"
-                    )
-                    
-                    # Marcar el procesamiento como completo para mantener los resultados visibles
-                    st.session_state['processing_complete'] = True
-                    
-                    # Botón para iniciar una nueva carga de datos
-                    st.write("")
-                    st.write("")
-                    if st.button("Iniciar una nueva carga de datos", key="new_upload"):
-                        # Reiniciar el estado pero mantener las credenciales de sesión
-                        for key in ['orders_status_df', 'validation_complete', 'show_process_button', 
-                                  'processing_complete', 'processing_results', 'log_file', 'results_df']:
-                            if key in st.session_state:
-                                del st.session_state[key]
+                        
                         st.experimental_rerun()
+                else:
+                    if processable_count < total_count:
+                        st.warning(f"⚠️ Solo {processable_count} de {total_count} registros son procesables. Corrija los errores antes de continuar.")
+                    elif processable_count == 0:
+                        st.error("❌ No hay registros procesables. Revise los datos y corrija los errores.")
 
         except Exception as e:
             st.error(f"Error al procesar el archivo: {str(e)}")
-            import traceback
-            st.error(traceback.format_exc())
 
-main()
+def main():
+    """Función principal con sistema de navegación multi-página"""
+    
+    # Configuración de la página
+    st.set_page_config(
+        page_title="Sistema de Pagos y Formateador IPS",
+        page_icon="🏠",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Configurar navegación
+    setup_page_navigation()
+    
+    # Obtener página actual
+    current_page = get_current_page()
+    
+    # Renderizar página según selección
+    if current_page == "🏠 Importar Pagos":
+        render_import_pagos_page()
+    elif current_page == "📄 Formateador IPS":
+        render_ips_formatter()
+    else:
+        st.error(f"Página no encontrada: {current_page}")
+        render_import_pagos_page()  # Fallback a página principal
+
+if __name__ == "__main__":
+    main()
