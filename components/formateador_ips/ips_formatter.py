@@ -158,17 +158,45 @@ class IPSFormatter:
             
             # Procesar fecha FECINI
             try:
-                fecini_str = str(row['FECINI'])
-                if '/' in fecini_str:
+                fecini_value = row['FECINI']
+                fecini_str = str(fecini_value).strip()
+                
+                # Si está vacío o es NaN, usar valor por defecto
+                is_nan = pd.isna(fecini_value)
+                if is_nan or fecini_str == '' or fecini_str.lower() == 'nan':
+                    fecini = "01012024"  # Valor por defecto
+                elif '/' in fecini_str:
+                    # Formato DD/MM/YYYY
                     fecha_parts = fecini_str.split('/')
                     if len(fecha_parts) == 3:
-                        fecini = f"{fecha_parts[0].zfill(2)}{fecha_parts[1].zfill(2)}{fecha_parts[2]}"
+                        dia = fecha_parts[0].zfill(2)
+                        mes = fecha_parts[1].zfill(2)
+                        año = fecha_parts[2]
+                        fecini = f"{dia}{mes}{año}"
                     else:
                         raise ValueError("Formato de fecha incorrecto")
+                elif len(fecini_str) == 8 and fecini_str.isdigit():
+                    # Ya está en formato DDMMYYYY
+                    fecini = fecini_str
                 else:
-                    fecini = "01012024"  # Valor por defecto
-            except:
-                self.errors.append(f"Línea {line_number}: Fecha FECINI inválida: {row['FECINI']}")
+                    # Intentar parsear como fecha
+                    from datetime import datetime
+                    try:
+                        # Intentar varios formatos
+                        for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y%m%d']:
+                            try:
+                                fecha_obj = datetime.strptime(fecini_str, fmt)
+                                fecini = fecha_obj.strftime('%d%m%Y')
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            # Si no se pudo parsear con ningún formato
+                            raise ValueError("Formato de fecha no reconocido")
+                    except:
+                        raise ValueError("Formato de fecha no reconocido")
+            except Exception as e:
+                self.errors.append(f"Línea {line_number}: Fecha FECINI inválida '{row['FECINI']}': {str(e)}")
                 continue
             
             # Crear registro completo
