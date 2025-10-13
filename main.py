@@ -1486,6 +1486,10 @@ def main():
     # Renderizar página según selección
     if current_page == "🏠 Importar Pagos":
         render_import_pagos_page()
+    elif current_page == "💳 Transacciones BcoEstado":
+        # Importar y ejecutar la página de transacciones
+        from pages.transacciones_bcoestado import main as transacciones_main
+        transacciones_main()
     elif current_page == "📄 Formateador IPS":
         render_ips_formatter()
     else:

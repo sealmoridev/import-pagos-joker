@@ -11,9 +11,15 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from components.formateador_ips import render_ips_formatter
+from auth_utils import check_internal_auth, show_auth_form
 
 def main():
     """Página principal del formateador IPS"""
+    
+    # Verificar autenticación
+    if not check_internal_auth():
+        show_auth_form()
+        return
     
     # Configuración de la página
     st.set_page_config(

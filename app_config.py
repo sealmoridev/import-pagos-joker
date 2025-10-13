@@ -7,6 +7,7 @@ from typing import Dict, Callable
 import os
 from dotenv import load_dotenv
 import xmlrpc.client
+from auth_utils import check_internal_auth, logout_internal
 
 class AppConfig:
     """Configuración centralizada de la aplicación"""
@@ -18,11 +19,19 @@ class AppConfig:
             "module": "main",
             "critical": True
         },
+        "💳 Transacciones BcoEstado": {
+            "icon": "💳",
+            "description": "Visualizar transacciones de pagos de Banco Estado",
+            "module": "pages.transacciones_bcoestado",
+            "critical": False,
+            "protected": True  # Requiere autenticación
+        },
         "📄 Formateador IPS": {
             "icon": "📄", 
             "description": "Convertir archivos Excel a formato IPS",
             "module": "pages.formateador_ips",
-            "critical": False
+            "critical": False,
+            "protected": True  # Requiere autenticación
         }
     }
     
@@ -48,12 +57,19 @@ def setup_page_navigation():
     if 'current_page' not in st.session_state:
         st.session_state.current_page = "🏠 Importar Pagos"
     
+    # Verificar autenticación para páginas internas
+    is_authenticated = check_internal_auth()
+    
     # Sidebar para navegación
     with st.sidebar:
         st.markdown("## 🧭 Navegación")
         
         # Mostrar páginas disponibles
         for page_name, config in AppConfig.PAGES.items():
+            # Ocultar páginas protegidas si no está autenticado
+            if config.get("protected", False) and not is_authenticated:
+                continue
+            
             is_current = st.session_state.current_page == page_name
             
             # Estilo diferente para página crítica
@@ -73,6 +89,12 @@ def setup_page_navigation():
             ):
                 st.session_state.current_page = page_name
                 st.rerun()
+        
+        # Botón de logout si está autenticado
+        if is_authenticated:
+            st.markdown("---")
+            if st.button("🔒 Cerrar Sesión Páginas Internas", use_container_width=True, type="secondary"):
+                logout_internal()
         
         # Separador
         st.markdown("---")
