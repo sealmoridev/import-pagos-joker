@@ -171,11 +171,11 @@ def validate_orders_status(models, db, uid, password, df):
     # Crear columna limpia de reserva para comparaciones
     df['Reserva_Clean'] = df['Reserva'].astype(str).str.strip()
     
-    for index, row in df.iterrows():
-        # Actualizar progreso
-        progress = (index + 1) / total_orders
+    for order_num, (index, row) in enumerate(df.iterrows(), start=1):
+        # Actualizar progreso usando contador secuencial
+        progress = order_num / total_orders
         progress_bar.progress(progress)
-        status_container.info(f"Validando orden {index + 1} de {total_orders}: {row['Reserva']}")
+        status_container.info(f"Validando orden {order_num} de {total_orders}: {row['Reserva']}")
         
         reserva = str(row['Reserva']).strip()
         monto_abono = float(row['Monto Abono'])
@@ -804,28 +804,28 @@ def process_payments(models, db, uid, password, df, orders_status_df, progress_c
     pagos_registrados = 0
     conciliaciones_exitosas = 0
     
-    for idx, row in df.iterrows():
+    for record_num, (idx, row) in enumerate(df.iterrows(), start=1):
         reserva = str(row['Reserva']).strip()
         
         # Crear entrada de auditoría
         audit_entry = processor.create_audit_entry(reserva)
         
-        # Mostrar progreso general
-        general_progress = (idx + 1) / total_records
+        # Mostrar progreso general usando contador secuencial
+        general_progress = record_num / total_records
         with general_progress_placeholder.container():
-            st.subheader(f"📊 Progreso General: {idx + 1}/{total_records} registros procesados")
+            st.subheader(f"📊 Progreso General: {record_num}/{total_records} registros procesados")
             st.progress(general_progress)
         
         # Mostrar orden actual
         with current_order_placeholder.container():
-            st.info(f"🔄 Procesando orden {idx + 1} de {total_records}: **{reserva}**")
+            st.info(f"🔄 Procesando orden {record_num} de {total_records}: **{reserva}**")
             current_phase = st.empty()
         
         # Crear barra de progreso individual
         progress_bar = st.progress(0)
         
         try:
-            progress_container.info(f"Procesando {idx + 1}/{total_records}: {reserva}")
+            progress_container.info(f"Procesando {record_num}/{total_records}: {reserva}")
             
             # Procesar el registro usando la función existente pero con auditoría
             def update_step(message):
