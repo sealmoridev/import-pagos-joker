@@ -19,6 +19,13 @@ class AppConfig:
             "module": "main",
             "critical": True
         },
+        "🧹 Limpieza de Órdenes": {
+            "icon": "🧹",
+            "description": "Limpiar referencias corruptas en órdenes de venta",
+            "module": "cleanup_orders",
+            "critical": False,
+            "protected": False
+        },
         "💳 Transacciones BcoEstado": {
             "icon": "💳",
             "description": "Visualizar transacciones de pagos de Banco Estado",
