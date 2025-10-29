@@ -1439,11 +1439,21 @@ def render_import_pagos_page():
                             st.error("❌ No se pudo conectar a Odoo para procesar pagos")
                             return
                         
-                        # Filtrar solo los registros procesables
-                        processable_df = df[df['Reserva'].isin(orders_status_df[orders_status_df['Procesable']]['Reserva'])]
+                        # Filtrar solo los registros procesables usando columnas limpias
+                        # Asegurar que ambos DataFrames tengan la columna limpia
+                        if 'Reserva_Clean' not in df.columns:
+                            df['Reserva_Clean'] = df['Reserva'].astype(str).str.strip()
+                        
+                        # Obtener lista de reservas procesables
+                        reservas_procesables = orders_status_df[orders_status_df['Procesable']]['Reserva_Str'].astype(str).str.strip().tolist()
+                        
+                        # Filtrar usando la columna limpia
+                        processable_df = df[df['Reserva_Clean'].isin(reservas_procesables)].copy()
                         
                         if len(processable_df) == 0:
                             st.error("No hay registros procesables para procesar.")
+                            st.info(f"Debug: Reservas en df: {df['Reserva_Clean'].tolist()}")
+                            st.info(f"Debug: Reservas procesables: {reservas_procesables}")
                             return
                         
                         # Procesar los pagos
