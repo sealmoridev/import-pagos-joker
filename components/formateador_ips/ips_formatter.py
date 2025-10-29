@@ -217,7 +217,7 @@ class IPSFormatter:
                 'DISA-NOMBRE': str(row['NOMBRE'])[:40],
                 'DISA-MONDE': str(row['MONTO']).zfill(10),
                 'DISA-FECINI': fecini,
-                'DISA-FECVEN': str(fixed_params.get('fecven', '99999999')),
+                'DISA-FECVEN': str(fixed_params.get('fecven', '00000000')),
                 'DISA-CANCUO': str(row['CANCUO']).zfill(3),
                 'DISA-FECMOV': f"{fixed_params['mes']:02d}{fixed_params['año']}",
                 'DISA-AGENCIA': str(fixed_params['agencia']).zfill(3)
@@ -275,7 +275,7 @@ class IPSFormatter:
                 'DISA-NUMRET': str(fixed_params.get('numret', 0)),
                 'DISA-TIPMOV': str(fixed_params.get('tipmov', 1)),
                 'DISA-FECMOV': f"{fixed_params.get('mes', 1):02d}{fixed_params.get('año', 2024)}",
-                'DISA-FECVEN': '99999999',
+                'DISA-FECVEN': '00000000',
                 'DISA-AGENCIA': str(fixed_params.get('agencia', 972))
             }
             

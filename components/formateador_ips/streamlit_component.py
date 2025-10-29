@@ -118,9 +118,9 @@ def render_ips_formatter():
         # Fecha de vencimiento editable
         fecven_input = st.text_input(
             "FECVEN (Fecha Vencimiento)",
-            value="99999999",
+            value="00000000",
             max_chars=8,
-            help="Fecha de vencimiento en formato DDMMAAAA (8 dígitos). Por defecto: 99999999"
+            help="Fecha de vencimiento en formato DDMMAAAA (8 dígitos). Por defecto: 00000000"
         )
         
         # Obtener mes y año de la fecha del movimiento
