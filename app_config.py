@@ -33,6 +33,13 @@ class AppConfig:
             "critical": False,
             "protected": True  # Requiere autenticación
         },
+        "💰 Transacciones Electrónicas": {
+            "icon": "💰",
+            "description": "Visualizar transacciones electrónicas desde Odoo (payment.transaction)",
+            "module": "pages.transacciones_electronicas",
+            "critical": False,
+            "protected": False  # Solo requiere credenciales de Odoo
+        },
         "📄 Formateador IPS": {
             "icon": "📄", 
             "description": "Convertir archivos Excel a formato IPS",

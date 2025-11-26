@@ -1504,6 +1504,10 @@ def main():
         # Importar y ejecutar la página de transacciones
         from pages.transacciones_bcoestado import main as transacciones_main
         transacciones_main()
+    elif current_page == "💰 Transacciones Electrónicas":
+        # Importar y ejecutar la página de transacciones electrónicas
+        from pages.transacciones_electronicas import main as transacciones_electronicas_main
+        transacciones_electronicas_main()
     elif current_page == "📄 Formateador IPS":
         render_ips_formatter()
     else:
