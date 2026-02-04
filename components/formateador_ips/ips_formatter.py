@@ -85,6 +85,9 @@ class IPSFormatter:
             numeric_value = re.sub(r'[^0-9]', '', str_value)
             if not numeric_value:
                 numeric_value = '0'
+            # DISA-MONDE requiere 3 ceros a la derecha (simula 3 decimales)
+            if field_name == 'DISA-MONDE':
+                numeric_value = f"{numeric_value}000"
             return numeric_value.zfill(length)
         else:
             # Texto - truncar o rellenar con espacios
@@ -215,7 +218,7 @@ class IPSFormatter:
                 'DISA-NUMRET': str(fixed_params['numret']),
                 'DISA-TIPMOV': str(fixed_params['tipmov']),
                 'DISA-NOMBRE': str(row['NOMBRE'])[:40],
-                'DISA-MONDE': str(row['MONTO']).zfill(10),
+                'DISA-MONDE': str(row['MONTO']),
                 'DISA-FECINI': fecini,
                 'DISA-FECVEN': str(fixed_params.get('fecven', '00000000')),
                 'DISA-CANCUO': str(row['CANCUO']).zfill(3),
